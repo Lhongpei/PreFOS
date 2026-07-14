@@ -1,0 +1,54 @@
+# Copyright 2026 Hongpei Li
+# SPDX-License-Identifier: Apache-2.0
+
+name: CUDA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, development]
+    paths:
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "include/**"
+      - "src/**"
+      - "tests/test_prefos.c"
+      - "tests/test_prefos_cpp.cpp"
+      - ".github/workflows/cuda.yml"
+  pull_request:
+    paths:
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "include/**"
+      - "src/**"
+      - "tests/test_prefos.c"
+      - "tests/test_prefos_cpp.cpp"
+      - ".github/workflows/cuda.yml"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends cmake g++ ninja-build
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DPREFOS_BUILD_TESTING=ON
+          -DPREFOS_ENABLE_CUDA=ON
+          -DCMAKE_CUDA_ARCHITECTURES=90
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test CPU fallback without a GPU runner
+        run: ctest --test-dir build --output-on-failure

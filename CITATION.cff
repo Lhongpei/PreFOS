@@ -1,0 +1,14 @@
+# Copyright 2026 Hongpei Li
+# SPDX-License-Identifier: Apache-2.0
+
+cff-version: 1.2.0
+message: "If you use PreFOS, please cite this software."
+title: "PreFOS: A Presolver for First-Order Solvers"
+type: software
+authors:
+  - family-names: Li
+    given-names: Hongpei
+version: 0.1.0
+repository-code: "https://github.com/Lhongpei/PreFOS"
+url: "https://github.com/Lhongpei/PreFOS"
+license: Apache-2.0

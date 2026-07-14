@@ -1,0 +1,11 @@
+PreFOS
+Copyright 2026 Hongpei Li
+
+This product includes software derived from PSLP, developed by Daniel
+Cederberg and Stephen Boyd:
+
+    PSLP - A Lightweight C Presolver for Linear Programs
+    Copyright 2025-2026 Daniel Cederberg
+    https://github.com/dance858/PSLP
+
+PSLP and PreFOS are licensed under the Apache License, Version 2.0.
