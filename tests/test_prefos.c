@@ -1855,7 +1855,10 @@ static int test_psd_verification(void)
 
 static int test_strict_settings(void)
 {
+    PreFOSSettings defaults = prefos_default_settings();
     PreFOSSettings settings = prefos_strict_settings();
+    CHECK(defaults.parallel_row_max_average_nnz == 256.0);
+    CHECK(defaults.redundant_row_max_average_nnz == 256.0);
     CHECK(settings.feasibility_tolerance == 0.0);
     CHECK(settings.fixed_variable_tolerance == 0.0);
     CHECK(settings.finite_bound_improvement_absolute == 0.0);
@@ -1877,6 +1880,8 @@ static int test_strict_settings(void)
     CHECK(settings.parallel_column_reduction);
     CHECK(settings.remove_redundant_bounds);
     CHECK(!settings.structural_reductions_gpu);
+    CHECK(settings.parallel_row_max_average_nnz == 0.0);
+    CHECK(settings.redundant_row_max_average_nnz == 0.0);
     return 0;
 }
 
@@ -3566,6 +3571,58 @@ static int test_parallel_row_reduction_and_postsolve(void)
     return 0;
 }
 
+static int test_parallel_row_work_budget(void)
+{
+    double A_values[] = {1.0, 1.0, 1.0, 1.0};
+    int A_columns[] = {0, 1, 0, 1};
+    int A_rows[] = {0, 2, 4};
+    double lower[] = {-INFINITY, -INFINITY};
+    double upper[] = {4.0, 6.0};
+    int Q_rows[] = {0, 0, 0};
+    int R_rows[] = {0};
+    double c[] = {0.0, 0.0};
+    int cone_indices[] = {0, 1};
+    PreFOSConeBlock cone = {
+        PREFOS_CONE_SECOND_ORDER, 2, 0, cone_indices, 0.0};
+    PreFOSProblemData problem;
+    PreFOSSettings settings = prefos_strict_settings();
+    PreFOSPresolver *presolver = NULL;
+
+    memset(&problem, 0, sizeof(problem));
+    problem.n = 2;
+    problem.A = (PreFOSCsrMatrix){2, 2, 4, A_values, A_columns, A_rows};
+    problem.constraint_lower = lower;
+    problem.constraint_upper = upper;
+    problem.Q = (PreFOSCsrMatrix){2, 2, 0, NULL, NULL, Q_rows};
+    problem.q_storage = PREFOS_Q_UPPER_TRIANGULAR;
+    problem.R = (PreFOSCsrMatrix){0, 2, 0, NULL, NULL, R_rows};
+    problem.c = c;
+    problem.n_cones = 1;
+    problem.cones = &cone;
+
+    settings.parallel_row_max_average_nnz = 1.0;
+    settings.redundant_row_max_average_nnz = 1.0;
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
+    CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_OK);
+    CHECK(prefos_get_reduced_problem(presolver)->A.rows == 2);
+    CHECK(prefos_get_stats(presolver)->parallel_row_budget_skips == 1);
+    CHECK(prefos_get_stats(presolver)->parallel_row_detection_milliseconds == 0.0);
+    CHECK(prefos_get_stats(presolver)->redundant_row_activity_budget_skips == 1);
+    prefos_free_presolver(presolver);
+
+    settings.parallel_row_max_average_nnz = 0.0;
+    settings.redundant_row_max_average_nnz = 0.0;
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
+    CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
+    CHECK(prefos_get_reduced_problem(presolver)->A.rows == 1);
+    CHECK(prefos_get_stats(presolver)->parallel_row_budget_skips == 0);
+    CHECK(prefos_get_stats(presolver)->parallel_row_detection_milliseconds >= 0.0);
+    prefos_free_presolver(presolver);
+    return 0;
+}
+
 static int test_infeasible_parallel_rows(void)
 {
     double A_values[] = {1.0, 1.0, -1.0, -1.0};
@@ -4661,6 +4718,7 @@ int main(void)
     if (test_full_q_symmetry_validation()) return 1;
     if (test_empty_model_round_trip()) return 1;
     if (test_parallel_row_reduction_and_postsolve()) return 1;
+    if (test_parallel_row_work_budget()) return 1;
     if (test_infeasible_parallel_rows()) return 1;
     if (test_interleaved_row_and_bound_postsolve()) return 1;
     if (test_cone_linked_free_column_substitution()) return 1;

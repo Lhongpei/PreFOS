@@ -101,6 +101,16 @@ limit disables that adaptive guard, and `prefos_strict_settings()` disables both
 Statistics expose event/full rounds, work, fallback count, and budget/stale
 stop counts.
 
+Parallel-row detection has a separate density guard because scale-invariant
+coefficient hashing is comparatively expensive on very long rows.
+`parallel_row_max_average_nnz` skips this optional pass when the original
+matrix average exceeds the configured width. The default is 256, while zero
+forces full detection. `parallel_row_budget_skips` and
+`parallel_row_detection_milliseconds` report the decision and executed work.
+Activity-based redundant-row checks use the independent
+`redundant_row_max_average_nnz` guard with the same default and zero semantics;
+`redundant_row_activity_budget_skips` records skipped passes.
+
 ## Linear Column Reductions
 
 PreFOS applies LP-style column rules to independent box variables that are
@@ -235,27 +245,43 @@ normal and equality duals. `prefos_postsolve_primal_dual()` has no affine-dual
 argument and returns `PREFOS_STATUS_DUAL_RECOVERY_UNAVAILABLE` when affine
 blocks are present.
 
-## CUDA Linear Propagation
+## CUDA Presolve Backend
 
-The experimental CUDA bulk engine uploads the immutable CSR data once and
-keeps it resident across propagation rounds; only bounds and reduced candidates
-move each round. Rows shorter than 256 entries use one thread per row. Longer
-rows are bucketed at setup and use one block per row with CUB block reductions.
-The first pass atomically reduces row implications to the strongest candidate
-per variable; a second lock-free pass identifies a valid source row for
-postsolve. The CPU then applies candidates through the regular tolerance and
-transformation-log path. Per-row floating-point error estimates relax device
-candidates outward, and suspected infeasibility is rechecked by the CPU. CUDA's
-primary context and asynchronous allocation pool persist at process scope; GPU
-setup, transfer, kernel, total, long-row, round, and fallback statistics are
-exposed for backend comparisons.
+The CUDA backend uploads immutable CSR and direct-cone metadata into one model
+workspace and keeps them resident across presolve passes. Bounds, row sides,
+and removal flags are synchronized when needed. If affine cone-coordinate
+aggregation changes direct-cone ownership, the workspace is invalidated and
+rebuilt before its next use.
+
+Bulk linear propagation uses one thread per short row and one CUB reduction
+block per row with at least 256 entries. A candidate pass is followed by a
+source-row pass, after which the CPU applies implications through the regular
+tolerance and transformation-log path.
 
 When `structural_reductions_gpu = 1`, a block-per-row CUDA pass also computes
 active column degrees and directional row locks for empty-column detection and
-dual fixing. CPU-only builds and runtime failures use the same CPU rules and
-increment `structural_gpu_fallbacks`; successful device passes increment
-`structural_gpu_passes`. The option is disabled by default because small host
-models do not amortize device setup.
+dual fixing. Parallel-row detection computes scale-invariant row hashes and
+sorts them with a device radix sort; the CPU exactly verifies equal-hash groups
+before committing a reduction. Cone-aware activity sorts matrix entries by
+`(row, cone)` once and caches the grouping. SOC, rotated SOC, exponential, and
+power dual-support tests run on the device. PSD support uses a sufficient
+diagonal-dominance test, with uncertain rows sent to the CPU.
+
+When `linear_propagation_gpu = 1`, direct SOC and rotated-SOC envelope rounds
+run on the device. Exponential, power, and PSD blocks produce batched basic
+envelopes there and then use the CPU for nonlinear or higher-order verification.
+Each direct-cone round is followed by a GPU linear pass whose candidate map
+targets non-box coordinates. Row implications therefore tighten internal cone
+envelopes, and the next cone round can use them without materializing box
+constraints on cone variables. Affine cone propagation, facial reductions,
+transformation logging, and final candidate commits remain on the CPU.
+
+Device candidates are relaxed outward. Suspected infeasibility, redundant-row
+candidates, uncertain PSD support, and hash collisions are rechecked by the CPU.
+CPU-only builds and runtime failures use the same CPU rules. The backend exposes
+workspace setup, parallel-row, cone-activity, cone-round, transfer, kernel,
+round, and fallback statistics. Both GPU settings are disabled by default
+because small models may not amortize context setup and kernel launches.
 
 ## Direct Cone Reductions
 

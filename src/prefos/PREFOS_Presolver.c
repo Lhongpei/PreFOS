@@ -14,6 +14,7 @@
 #include "explorers/PREFOS_AffineFaceSubstitution.h"
 #include "explorers/PREFOS_ConePropagation.h"
 #include "explorers/PREFOS_ColumnReductions.h"
+#include "explorers/PREFOS_CudaBackend.h"
 #include "explorers/PREFOS_CudaLinearPropagation.h"
 #include "explorers/PREFOS_FreeColumnSubstitution.h"
 #include "explorers/PREFOS_LinearPropagation.h"
@@ -839,6 +840,7 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     PreFOSPresolvedProblem *target;
 
     if (!presolver) return PREFOS_STATUS_INVALID_ARGUMENT;
+    prefos_internal_cuda_workspace_release(presolver);
     prefos_internal_free_reduced_problem(&presolver->reduced);
     free(presolver->original_to_reduced);
     free(presolver->original_to_reduced_rows);
@@ -953,7 +955,15 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     if (status != PREFOS_STATUS_OK) goto failure;
     status = prefos_internal_reduce_linear_columns(presolver);
     if (status != PREFOS_STATUS_OK) goto failure;
-    status = prefos_internal_aggregate_affine_cone_coordinates(presolver);
+    {
+        size_t aggregations_before =
+            presolver->stats.aggregated_affine_cone_coordinates;
+        status =
+            prefos_internal_aggregate_affine_cone_coordinates(presolver);
+        if (presolver->stats.aggregated_affine_cone_coordinates >
+            aggregations_before)
+            prefos_internal_cuda_workspace_release(presolver);
+    }
     if (status != PREFOS_STATUS_OK) goto failure;
     {
         PreFOSTimestamp start, stop;

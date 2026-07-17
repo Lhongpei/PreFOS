@@ -217,7 +217,7 @@ int presolve_find_parallel_rows(
     int *sort_auxiliary, int *group_starts, size_t group_starts_capacity,
     size_t *n_groups)
 {
-    size_t row, active_count = 0, output_count = 0, group_count = 0;
+    size_t row, active_count = 0;
     if (!matrix || !parallel_rows || !sort_auxiliary ||
         !group_starts || !n_groups || !isfinite(tolerance) || tolerance < 0.0 ||
         group_starts_capacity == 0 || matrix->n_rows > (size_t) INT_MAX)
@@ -235,6 +235,22 @@ int presolve_find_parallel_rows(
     sort_rows(parallel_rows, active_count, support_hashes, coefficient_hashes,
               sort_auxiliary);
 
+    return presolve_collect_parallel_row_groups(
+        matrix, tolerance, parallel_rows, active_count, support_hashes,
+        coefficient_hashes, group_starts, group_starts_capacity, n_groups);
+}
+
+int presolve_collect_parallel_row_groups(
+    const PresolveSparseRowView *matrix, double tolerance,
+    int *parallel_rows, size_t active_count, const int *support_hashes,
+    const int *coefficient_hashes, int *group_starts,
+    size_t group_starts_capacity, size_t *n_groups)
+{
+    size_t row, output_count = 0, group_count = 0;
+    if (!matrix || !parallel_rows || !support_hashes || !coefficient_hashes ||
+        !group_starts || !n_groups || !isfinite(tolerance) || tolerance < 0.0 ||
+        group_starts_capacity == 0)
+        return 0;
     group_starts[0] = 0;
     for (row = 0; row < active_count;)
     {

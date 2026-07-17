@@ -7,7 +7,10 @@
 
 #include "PREFOS_AffineConeBounds.h"
 #include "PREFOS_AffineConePropagation.h"
+#include "PREFOS_CudaBackend.h"
+#include "PREFOS_CudaLinearPropagation.h"
 #include "PREFOS_LinearPropagation.h"
+#include "LinearPropagationKernel.h"
 #include "core/PREFOS_Timer.h"
 #include "cones/PREFOS_ExponentialCone.h"
 #include "cones/PREFOS_PositiveSemidefiniteCone.h"
@@ -768,6 +771,12 @@ PreFOSStatus prefos_internal_propagate_cone_envelopes(PreFOSPresolver *presolver
 {
     int round;
     PreFOSStatus status;
+    PreFOSCudaWorkspace *cuda_workspace = NULL;
+    double *cuda_lower_candidates = NULL, *cuda_upper_candidates = NULL;
+    unsigned char *cuda_cone_flags = NULL;
+    int *cuda_lower_sources = NULL, *cuda_upper_sources = NULL;
+    int *cuda_candidate_map = NULL;
+    int cuda_available = 0;
     if (!presolver->settings.cone_propagation ||
         presolver->settings.max_cone_propagation_rounds == 0 ||
         (presolver->original.n_cones == 0 &&
@@ -778,25 +787,189 @@ PreFOSStatus prefos_internal_propagate_cone_envelopes(PreFOSPresolver *presolver
     if (status != PREFOS_STATUS_OK) return status;
     status = prefos_internal_materialize_affine_cone_bounds(presolver);
     if (status != PREFOS_STATUS_OK) return status;
+    if (presolver->settings.linear_propagation_gpu &&
+        presolver->original.n_cones > 0)
+    {
+        PreFOSCudaPropagationStatus cuda_status;
+        cuda_workspace =
+            prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+        cuda_lower_candidates = (double *) prefos_internal_alloc_array(
+            presolver->original.n, sizeof(double));
+        cuda_upper_candidates = (double *) prefos_internal_alloc_array(
+            presolver->original.n, sizeof(double));
+        cuda_cone_flags = (unsigned char *) prefos_internal_alloc_array(
+            presolver->original.n_cones, sizeof(unsigned char));
+        cuda_lower_sources = (int *) prefos_internal_alloc_array(
+            presolver->original.n, sizeof(int));
+        cuda_upper_sources = (int *) prefos_internal_alloc_array(
+            presolver->original.n, sizeof(int));
+        cuda_candidate_map = (int *) prefos_internal_alloc_array(
+            presolver->original.n, sizeof(int));
+        if ((presolver->original.n > 0 &&
+             (!cuda_lower_candidates || !cuda_upper_candidates ||
+              !cuda_lower_sources || !cuda_upper_sources ||
+              !cuda_candidate_map)) ||
+            !cuda_cone_flags)
+        {
+            free(cuda_lower_candidates);
+            free(cuda_upper_candidates);
+            free(cuda_cone_flags);
+            free(cuda_lower_sources);
+            free(cuda_upper_sources);
+            free(cuda_candidate_map);
+            return PREFOS_STATUS_OUT_OF_MEMORY;
+        }
+        for (size_t column = 0; column < presolver->original.n; ++column)
+            cuda_candidate_map[column] =
+                presolver->variable_to_box[column] < 0 &&
+                        !presolver->is_fixed[column] &&
+                        !presolver->is_substituted[column] &&
+                        !presolver->is_parallel_removed[column]
+                    ? (int) column
+                    : -1;
+        if (cuda_workspace && cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+            cuda_available = 1;
+        else
+            ++presolver->stats.cone_gpu_fallbacks;
+    }
     for (round = 0; round < presolver->settings.max_cone_propagation_rounds; ++round)
     {
         size_t k;
         int changed = 0;
+        int cuda_round_succeeded = 0;
         ++presolver->stats.cone_propagation_rounds;
+        if (cuda_available)
+        {
+            PreFOSCudaPropagationStatus cuda_status;
+            double gpu_milliseconds = 0.0;
+            cuda_status = prefos_cuda_cone_envelope_round(
+                cuda_workspace, presolver->propagation_lower,
+                presolver->propagation_upper,
+                presolver->settings.feasibility_tolerance,
+                cuda_lower_candidates, cuda_upper_candidates,
+                cuda_cone_flags, &gpu_milliseconds);
+            presolver->stats.cone_gpu_milliseconds += gpu_milliseconds;
+            if (cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+            {
+                cuda_round_succeeded = 1;
+                ++presolver->stats.cone_gpu_rounds;
+            }
+            else
+            {
+                cuda_available = 0;
+                ++presolver->stats.cone_gpu_fallbacks;
+            }
+        }
         for (k = 0; k < presolver->original.n_cones; ++k)
         {
             const PreFOSConeBlock *cone = &presolver->original.cones[k];
+            int needs_cpu = !cuda_round_succeeded;
+            size_t local;
             if (presolver->converted_affine_cones[k]) continue;
-            status = prefos_internal_propagate_cone_block_envelopes(
-                presolver, cone, presolver->propagation_lower,
-                presolver->propagation_upper, &changed);
-            if (status != PREFOS_STATUS_OK) return status;
+            if (cuda_round_succeeded &&
+                (cuda_cone_flags[k] & PREFOS_CUDA_CONE_PROCESSED) != 0)
+            {
+                for (local = 0; local < cone->dimension; ++local)
+                {
+                    int column = cone->indices[local];
+                    status = update_cone_envelope_lower(
+                        presolver, column, cuda_lower_candidates[column],
+                        &changed);
+                    if (status != PREFOS_STATUS_OK) goto cleanup;
+                    status = update_cone_envelope_upper(
+                        presolver, column, cuda_upper_candidates[column],
+                        &changed);
+                    if (status != PREFOS_STATUS_OK) goto cleanup;
+                }
+                needs_cpu =
+                    (cuda_cone_flags[k] &
+                     (PREFOS_CUDA_CONE_INFEASIBLE |
+                      PREFOS_CUDA_CONE_NEEDS_CPU)) != 0;
+            }
+            else if (cuda_round_succeeded)
+                needs_cpu = 1;
+            if (needs_cpu)
+            {
+                status = prefos_internal_propagate_cone_block_envelopes(
+                    presolver, cone, presolver->propagation_lower,
+                    presolver->propagation_upper, &changed);
+                if (status != PREFOS_STATUS_OK) goto cleanup;
+            }
         }
         status = prefos_internal_propagate_affine_cones(presolver, &changed);
-        if (status != PREFOS_STATUS_OK) return status;
+        if (status != PREFOS_STATUS_OK) goto cleanup;
+        if (cuda_round_succeeded &&
+            presolver->settings.linear_propagation &&
+            presolver->original.A.rows > 0)
+        {
+            PreFOSCudaPropagationStatus cuda_status;
+            double transfer_milliseconds = 0.0, kernel_milliseconds = 0.0;
+            int suspected_infeasible_row = -1;
+            cuda_status = prefos_cuda_linear_propagation_round(
+                cuda_workspace, presolver->propagation_lower,
+                presolver->propagation_upper,
+                presolver->working_constraint_lower,
+                presolver->working_constraint_upper, presolver->remove_rows,
+                cuda_candidate_map,
+                presolver->settings.feasibility_tolerance,
+                PRESOLVE_DEFAULT_MAX_INFERRED_BOUND_MAGNITUDE,
+                cuda_lower_candidates, cuda_upper_candidates,
+                cuda_lower_sources, cuda_upper_sources,
+                &suspected_infeasible_row, &transfer_milliseconds,
+                &kernel_milliseconds);
+            presolver->stats.cone_gpu_linear_transfer_milliseconds +=
+                transfer_milliseconds;
+            presolver->stats.cone_gpu_linear_kernel_milliseconds +=
+                kernel_milliseconds;
+            if (cuda_status != PREFOS_CUDA_PROPAGATION_OK)
+            {
+                cuda_available = 0;
+                ++presolver->stats.cone_gpu_fallbacks;
+            }
+            else
+            {
+                size_t column;
+                ++presolver->stats.cone_gpu_linear_rounds;
+                if (suspected_infeasible_row >= 0)
+                {
+                    status = prefos_internal_verify_linear_row_with_bounds(
+                        presolver, (size_t) suspected_infeasible_row,
+                        presolver->propagation_lower,
+                        presolver->propagation_upper);
+                    if (status != PREFOS_STATUS_OK) goto cleanup;
+                }
+                for (column = 0; column < presolver->original.n; ++column)
+                {
+                    if (cuda_candidate_map[column] < 0) continue;
+                    if (cuda_lower_sources[column] >= 0)
+                    {
+                        status = update_cone_envelope_lower(
+                            presolver, (int) column,
+                            cuda_lower_candidates[column], &changed);
+                        if (status != PREFOS_STATUS_OK) goto cleanup;
+                    }
+                    if (cuda_upper_sources[column] >= 0)
+                    {
+                        status = update_cone_envelope_upper(
+                            presolver, (int) column,
+                            cuda_upper_candidates[column], &changed);
+                        if (status != PREFOS_STATUS_OK) goto cleanup;
+                    }
+                }
+            }
+        }
         if (!changed) break;
     }
-    return PREFOS_STATUS_OK;
+    status = PREFOS_STATUS_OK;
+
+cleanup:
+    free(cuda_lower_candidates);
+    free(cuda_upper_candidates);
+    free(cuda_cone_flags);
+    free(cuda_lower_sources);
+    free(cuda_upper_sources);
+    free(cuda_candidate_map);
+    return status;
 }
 
 static int find_zero_upper_singleton_source(const PreFOSPresolver *presolver,

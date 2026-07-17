@@ -12,6 +12,7 @@ PreFOSStatus prefos_internal_reduce_linear_columns(PreFOSPresolver *presolver)
     PreFOSColumnWorkspace workspace;
     PreFOSTimestamp start, stop;
     PreFOSStatus status;
+    if (presolver->original.n_box == 0) return PREFOS_STATUS_OK;
     prefos_internal_timer_now(&start);
     status = prefos_internal_build_column_workspace(presolver, &workspace);
     if (status != PREFOS_STATUS_OK) return status;
@@ -37,6 +38,7 @@ PreFOSStatus prefos_internal_reduce_parallel_columns(PreFOSPresolver *presolver)
     PreFOSColumnWorkspace workspace;
     PreFOSTimestamp start, stop;
     PreFOSStatus status;
+    if (presolver->original.n_box == 0) return PREFOS_STATUS_OK;
     prefos_internal_timer_now(&start);
     status = prefos_internal_build_column_workspace(presolver, &workspace);
     if (status == PREFOS_STATUS_OK)

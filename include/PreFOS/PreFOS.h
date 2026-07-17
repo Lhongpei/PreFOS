@@ -213,8 +213,18 @@ extern "C"
         int parallel_column_reduction;
         /* Remove row-implied box sides in the interior-point bound policy. */
         int remove_redundant_bounds;
-        /* Use CUDA for structural column statistics when available. */
+        /* Use CUDA for structural statistics and row candidate detection. */
         int structural_reductions_gpu;
+        /*
+         * Skip parallel-row detection above this average input row width.
+         * Zero disables the adaptive work limit.
+         */
+        double parallel_row_max_average_nnz;
+        /*
+         * Skip activity-based redundant-row checks above this average width.
+         * Zero disables the adaptive work limit.
+         */
+        double redundant_row_max_average_nnz;
     } PreFOSSettings;
 
     /*
@@ -290,6 +300,7 @@ extern "C"
         size_t cone_activity_strengthened_rows;
         size_t cone_activity_rows_removed;
         size_t cone_activity_infeasible_rows;
+        size_t redundant_row_activity_budget_skips;
         double redundant_row_activity_milliseconds;
         size_t exponential_cones_processed;
         size_t exponential_z_lower_attempts;
@@ -324,6 +335,8 @@ extern "C"
         size_t removed_redundant_rows;
         size_t removed_singleton_rows;
         size_t removed_empty_rows;
+        size_t parallel_row_budget_skips;
+        double parallel_row_detection_milliseconds;
         size_t materialized_propagated_box_bounds;
         size_t suppressed_propagated_box_bounds;
         size_t aggregated_affine_cone_coordinates;
@@ -374,6 +387,20 @@ extern "C"
         size_t structural_gpu_passes;
         size_t structural_gpu_fallbacks;
         double structural_reduction_milliseconds;
+        size_t parallel_row_gpu_passes;
+        size_t parallel_row_gpu_fallbacks;
+        size_t cone_activity_gpu_passes;
+        size_t cone_activity_gpu_fallbacks;
+        size_t cone_activity_gpu_candidates;
+        size_t cone_gpu_rounds;
+        size_t cone_gpu_linear_rounds;
+        size_t cone_gpu_fallbacks;
+        double cuda_workspace_setup_milliseconds;
+        double parallel_row_gpu_milliseconds;
+        double cone_activity_gpu_milliseconds;
+        double cone_gpu_milliseconds;
+        double cone_gpu_linear_transfer_milliseconds;
+        double cone_gpu_linear_kernel_milliseconds;
     } PreFOSStats;
 
     typedef struct

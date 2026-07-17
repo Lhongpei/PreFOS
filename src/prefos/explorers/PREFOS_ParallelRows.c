@@ -7,6 +7,8 @@
 
 #include "ParallelRowDetection.h"
 #include "ParallelRowReduction.h"
+#include "core/PREFOS_Timer.h"
+#include "PREFOS_CudaBackend.h"
 
 static int prefos_row_is_active(const void *context, size_t row)
 {
@@ -118,12 +120,31 @@ PreFOSStatus prefos_internal_remove_parallel_rows(PreFOSPresolver *presolver)
     int *workspace, *parallel_rows, *support_hashes, *coefficient_hashes;
     int *sort_auxiliary, *group_starts;
     size_t n_groups, group;
-    int detected;
+    PreFOSTimestamp start, stop;
+    PreFOSStatus status = PREFOS_STATUS_OK;
+    int detected = 0;
+    int over_cpu_budget;
 
     if (!presolver->settings.remove_redundant_rows || matrix->rows < 2)
         return PREFOS_STATUS_OK;
+    over_cpu_budget =
+        presolver->settings.parallel_row_max_average_nnz > 0.0 &&
+        (long double) matrix->nnz >
+            (long double) matrix->rows *
+                (long double)
+                    presolver->settings.parallel_row_max_average_nnz;
+    if (over_cpu_budget && !presolver->settings.structural_reductions_gpu)
+    {
+        ++presolver->stats.parallel_row_budget_skips;
+        return PREFOS_STATUS_OK;
+    }
+    prefos_internal_timer_now(&start);
     workspace = (int *) prefos_internal_alloc_array(5 * matrix->rows, sizeof(int));
-    if (!workspace) return PREFOS_STATUS_OUT_OF_MEMORY;
+    if (!workspace)
+    {
+        status = PREFOS_STATUS_OUT_OF_MEMORY;
+        goto finish;
+    }
     parallel_rows = workspace;
     support_hashes = workspace + matrix->rows;
     coefficient_hashes = workspace + 2 * matrix->rows;
@@ -133,28 +154,67 @@ PreFOSStatus prefos_internal_remove_parallel_rows(PreFOSPresolver *presolver)
         matrix->rows, matrix->values, matrix->column_indices,
         matrix->row_pointers, matrix->row_pointers + 1, 1};
 
-    detected = presolve_find_parallel_rows(
-        &view, prefos_row_is_active, presolver,
-        presolver->settings.feasibility_tolerance, NULL, parallel_rows,
-        support_hashes, coefficient_hashes, sort_auxiliary, group_starts,
-        matrix->rows, &n_groups);
+    if (presolver->settings.structural_reductions_gpu)
+    {
+        PreFOSCudaPropagationStatus cuda_status;
+        PreFOSCudaWorkspace *cuda_workspace =
+            prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+        size_t active_rows = 0;
+        double gpu_milliseconds = 0.0;
+        if (cuda_workspace && cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+        {
+            cuda_status = prefos_cuda_parallel_row_hash_sort(
+                cuda_workspace, presolver->remove_rows, parallel_rows,
+                support_hashes, coefficient_hashes, &active_rows,
+                &gpu_milliseconds);
+        }
+        presolver->stats.parallel_row_gpu_milliseconds += gpu_milliseconds;
+        if (cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+        {
+            detected = presolve_collect_parallel_row_groups(
+                &view, presolver->settings.feasibility_tolerance,
+                parallel_rows, active_rows, support_hashes,
+                coefficient_hashes, group_starts, matrix->rows, &n_groups);
+            if (detected)
+                ++presolver->stats.parallel_row_gpu_passes;
+        }
+        if (!detected)
+        {
+            ++presolver->stats.parallel_row_gpu_fallbacks;
+        }
+    }
     if (!detected)
     {
-        free(workspace);
-        return PREFOS_STATUS_NUMERICAL_ERROR;
+        if (over_cpu_budget)
+        {
+            ++presolver->stats.parallel_row_budget_skips;
+            goto cleanup;
+        }
+        detected = presolve_find_parallel_rows(
+            &view, prefos_row_is_active, presolver,
+            presolver->settings.feasibility_tolerance, NULL, parallel_rows,
+            support_hashes, coefficient_hashes, sort_auxiliary, group_starts,
+            matrix->rows, &n_groups);
+    }
+    if (!detected)
+    {
+        status = PREFOS_STATUS_NUMERICAL_ERROR;
+        goto cleanup;
     }
     for (group = 0; group < n_groups; ++group)
     {
         size_t start = (size_t) group_starts[group];
         size_t end = (size_t) group_starts[group + 1];
-        PreFOSStatus status = process_parallel_group(
+        status = process_parallel_group(
             presolver, parallel_rows + start, end - start);
-        if (status != PREFOS_STATUS_OK)
-        {
-            free(workspace);
-            return status;
-        }
+        if (status != PREFOS_STATUS_OK) goto cleanup;
     }
+
+cleanup:
     free(workspace);
-    return PREFOS_STATUS_OK;
+finish:
+    prefos_internal_timer_now(&stop);
+    presolver->stats.parallel_row_detection_milliseconds +=
+        prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+    return status;
 }

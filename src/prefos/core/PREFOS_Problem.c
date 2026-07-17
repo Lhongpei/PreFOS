@@ -4,6 +4,7 @@
  */
 
 #include "PREFOS_Internal.h"
+#include "explorers/PREFOS_CudaBackend.h"
 
 void prefos_internal_free_csr(PreFOSCsrMatrix *matrix)
 {
@@ -345,6 +346,10 @@ static PreFOSStatus validate_problem(const PreFOSProblemData *problem,
         settings->event_queue_max_average_column_degree < 0.0 ||
         !isfinite(settings->event_queue_activity_update_ratio) ||
         settings->event_queue_activity_update_ratio < 0.0 ||
+        !isfinite(settings->parallel_row_max_average_nnz) ||
+        settings->parallel_row_max_average_nnz < 0.0 ||
+        !isfinite(settings->redundant_row_max_average_nnz) ||
+        settings->redundant_row_max_average_nnz < 0.0 ||
         settings->max_aggregation_terms < 1 ||
         settings->max_aggregation_terms > PREFOS_MAX_AGGREGATION_TERMS ||
         settings->max_aggregation_column_degree < 1 ||
@@ -806,6 +811,8 @@ PreFOSSettings prefos_default_settings(void)
     settings.parallel_column_reduction = 1;
     settings.remove_redundant_bounds = 1;
     settings.structural_reductions_gpu = 0;
+    settings.parallel_row_max_average_nnz = 256.0;
+    settings.redundant_row_max_average_nnz = 256.0;
     return settings;
 }
 
@@ -820,6 +827,8 @@ PreFOSSettings prefos_strict_settings(void)
     settings.linear_propagation_min_changes_per_million = 0.0;
     settings.linear_propagation_max_stale_rounds = 0;
     settings.affine_psd_propagation_max_work_ratio = 0.0;
+    settings.parallel_row_max_average_nnz = 0.0;
+    settings.redundant_row_max_average_nnz = 0.0;
     return settings;
 }
 
@@ -852,9 +861,14 @@ PreFOSStatus prefos_create_presolver(const PreFOSProblemData *problem,
         prefos_free_presolver(result);
         return status;
     }
-    if (result->settings.linear_propagation_gpu && result->original.n_box > 0 &&
-        (long double) result->original.A.nnz / (long double) result->original.n_box >
-            (long double) result->settings.event_queue_max_average_column_degree)
+    if (result->settings.structural_reductions_gpu ||
+        (result->settings.linear_propagation_gpu &&
+         (result->original.n_cones > 0 ||
+          (result->original.n_box > 0 &&
+           (long double) result->original.A.nnz /
+                   (long double) result->original.n_box >
+               (long double)
+                   result->settings.event_queue_max_average_column_degree))))
         (void) prefos_gpu_warmup_async();
     *presolver = result;
     return PREFOS_STATUS_OK;
@@ -863,6 +877,7 @@ PreFOSStatus prefos_create_presolver(const PreFOSProblemData *problem,
 void prefos_free_presolver(PreFOSPresolver *presolver)
 {
     if (!presolver) return;
+    prefos_internal_cuda_workspace_release(presolver);
     prefos_internal_free_psd_face_reductions(presolver->psd_face_reductions,
                                           presolver->original.n_cones);
     free_problem_data(&presolver->original);

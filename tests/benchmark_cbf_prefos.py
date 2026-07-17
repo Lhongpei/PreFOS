@@ -123,6 +123,7 @@ class PreFOSStats(ct.Structure):
         ("cone_activity_strengthened_rows", ct.c_size_t),
         ("cone_activity_rows_removed", ct.c_size_t),
         ("cone_activity_infeasible_rows", ct.c_size_t),
+        ("redundant_row_activity_budget_skips", ct.c_size_t),
         ("redundant_row_activity_milliseconds", ct.c_double),
         ("exponential_cones_processed", ct.c_size_t),
         ("exponential_z_lower_attempts", ct.c_size_t),
@@ -157,6 +158,8 @@ class PreFOSStats(ct.Structure):
         ("removed_redundant_rows", ct.c_size_t),
         ("removed_singleton_rows", ct.c_size_t),
         ("removed_empty_rows", ct.c_size_t),
+        ("parallel_row_budget_skips", ct.c_size_t),
+        ("parallel_row_detection_milliseconds", ct.c_double),
         ("materialized_propagated_box_bounds", ct.c_size_t),
         ("suppressed_propagated_box_bounds", ct.c_size_t),
         ("aggregated_affine_cone_coordinates", ct.c_size_t),
@@ -194,6 +197,33 @@ class PreFOSStats(ct.Structure):
         ("fixed_affine_face_variables", ct.c_size_t),
         ("substituted_affine_face_variables", ct.c_size_t),
         ("affine_face_substitution_milliseconds", ct.c_double),
+        ("removed_empty_columns", ct.c_size_t),
+        ("removed_singleton_columns", ct.c_size_t),
+        ("tightened_singleton_rows", ct.c_size_t),
+        ("substituted_bounded_doubletons", ct.c_size_t),
+        ("dual_fixed_columns", ct.c_size_t),
+        ("merged_parallel_columns", ct.c_size_t),
+        ("removed_redundant_row_lower_sides", ct.c_size_t),
+        ("removed_redundant_row_upper_sides", ct.c_size_t),
+        ("removed_redundant_box_lower_bounds", ct.c_size_t),
+        ("removed_redundant_box_upper_bounds", ct.c_size_t),
+        ("structural_gpu_passes", ct.c_size_t),
+        ("structural_gpu_fallbacks", ct.c_size_t),
+        ("structural_reduction_milliseconds", ct.c_double),
+        ("parallel_row_gpu_passes", ct.c_size_t),
+        ("parallel_row_gpu_fallbacks", ct.c_size_t),
+        ("cone_activity_gpu_passes", ct.c_size_t),
+        ("cone_activity_gpu_fallbacks", ct.c_size_t),
+        ("cone_activity_gpu_candidates", ct.c_size_t),
+        ("cone_gpu_rounds", ct.c_size_t),
+        ("cone_gpu_linear_rounds", ct.c_size_t),
+        ("cone_gpu_fallbacks", ct.c_size_t),
+        ("cuda_workspace_setup_milliseconds", ct.c_double),
+        ("parallel_row_gpu_milliseconds", ct.c_double),
+        ("cone_activity_gpu_milliseconds", ct.c_double),
+        ("cone_gpu_milliseconds", ct.c_double),
+        ("cone_gpu_linear_transfer_milliseconds", ct.c_double),
+        ("cone_gpu_linear_kernel_milliseconds", ct.c_double),
     ]
 
 
@@ -494,7 +524,10 @@ def print_summary(result):
         f"stops=budget:{result['linear_budget_stops']},"
         f"stale:{result['linear_stale_stops']} "
         f"linear:{result['linear_propagation_milliseconds']:.1f}ms "
+        f"parallel-row:{result['parallel_row_detection_milliseconds']:.1f}ms "
+        f"parallel-skips:{result['parallel_row_budget_skips']} "
         f"row-activity:{result['redundant_row_activity_milliseconds']:.1f}ms "
+        f"row-activity-skips:{result['redundant_row_activity_budget_skips']} "
         f"cone:{result['cone_propagation_milliseconds']:.1f}ms "
         f"gpu=rounds:{result['linear_gpu_rounds']},"
         f"fallbacks:{result['linear_gpu_fallbacks']},"
@@ -503,6 +536,16 @@ def print_summary(result):
         f"kernel:{result['linear_gpu_kernel_milliseconds']:.1f}ms "
         f"total:{result['linear_gpu_total_milliseconds']:.1f}ms "
         f"long_rows:{result['linear_gpu_long_rows']} "
+        f"gpu-struct=workspace:"
+        f"{result['cuda_workspace_setup_milliseconds']:.1f}ms,"
+        f"parallel:{result['parallel_row_gpu_passes']}/"
+        f"{result['parallel_row_gpu_milliseconds']:.1f}ms,"
+        f"activity:{result['cone_activity_gpu_passes']}/"
+        f"{result['cone_activity_gpu_milliseconds']:.1f}ms,"
+        f"cone:{result['cone_gpu_rounds']}/"
+        f"{result['cone_gpu_milliseconds']:.1f}ms,"
+        f"cone-linear:{result['cone_gpu_linear_rounds']}/"
+        f"{result['cone_gpu_linear_kernel_milliseconds']:.1f}ms "
         f"rss={result['rss_after_presolve_mib']:.1f}MiB"
     )
 
@@ -544,6 +587,8 @@ def main():
     parser.add_argument("--linear-work-ratio", type=float)
     parser.add_argument("--linear-min-changes-per-million", type=float)
     parser.add_argument("--linear-max-stale-rounds", type=int)
+    parser.add_argument("--parallel-row-max-average-nnz", type=float)
+    parser.add_argument("--redundant-row-max-average-nnz", type=float)
     parser.add_argument(
         "--propagated-bound-policy",
         choices=("first-order", "interior-point"),
@@ -567,6 +612,7 @@ def main():
         setting_overrides["linear_propagation"] = 0
     if args.gpu_linear_propagation:
         setting_overrides["linear_propagation_gpu"] = 1
+        setting_overrides["structural_reductions_gpu"] = 1
     if args.disable_cone_propagation:
         setting_overrides["cone_propagation"] = 0
     if args.disable_cone_aware_activity:
@@ -620,6 +666,14 @@ def main():
     if args.linear_max_stale_rounds is not None:
         setting_overrides["linear_propagation_max_stale_rounds"] = (
             args.linear_max_stale_rounds
+        )
+    if args.parallel_row_max_average_nnz is not None:
+        setting_overrides["parallel_row_max_average_nnz"] = (
+            args.parallel_row_max_average_nnz
+        )
+    if args.redundant_row_max_average_nnz is not None:
+        setting_overrides["redundant_row_max_average_nnz"] = (
+            args.redundant_row_max_average_nnz
         )
 
     prefos = configure_prefos(Path(args.library).resolve())

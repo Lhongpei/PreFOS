@@ -54,6 +54,8 @@ typedef enum
     PREFOS_SUBSTITUTION_RESIDUAL_ROW
 } PreFOSSubstitutionMode;
 
+typedef struct PreFOSCudaWorkspace PreFOSCudaWorkspace;
+
 struct PreFOSPresolver
 {
     PreFOSProblemData original;
@@ -113,6 +115,7 @@ struct PreFOSPresolver
     size_t normalized_nonnegative_variables;
     size_t normalized_nonnegative_cones;
     size_t n_parallel_column_reductions;
+    PreFOSCudaWorkspace *cuda_workspace;
     int has_run;
 };
 

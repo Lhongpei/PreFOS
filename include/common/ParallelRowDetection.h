@@ -41,4 +41,10 @@ int presolve_find_parallel_rows(
     int *sort_auxiliary, int *group_starts, size_t group_starts_capacity,
     size_t *n_groups);
 
+int presolve_collect_parallel_row_groups(
+    const PresolveSparseRowView *matrix, double tolerance,
+    int *parallel_rows, size_t active_count, const int *support_hashes,
+    const int *coefficient_hashes, int *group_starts,
+    size_t group_starts_capacity, size_t *n_groups);
+
 #endif

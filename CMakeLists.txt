@@ -61,6 +61,7 @@ set(PREFOS_SOURCES
   src/prefos/explorers/PREFOS_AffineFaceSubstitution.c
   src/prefos/explorers/PREFOS_ConeActivity.c
   src/prefos/explorers/PREFOS_ConePropagation.c
+  src/prefos/explorers/PREFOS_CudaBackend.c
   src/prefos/explorers/PREFOS_BoundedDoubletons.c
   src/prefos/explorers/PREFOS_ColumnFixing.c
   src/prefos/explorers/PREFOS_ColumnReductions.c
@@ -77,7 +78,10 @@ set(PREFOS_SOURCES
 
 if(PREFOS_ENABLE_CUDA)
   list(APPEND PREFOS_SOURCES
+    src/prefos/explorers/PREFOS_CudaConeActivity.cu
+    src/prefos/explorers/PREFOS_CudaConePropagation.cu
     src/prefos/explorers/PREFOS_CudaLinearPropagation.cu
+    src/prefos/explorers/PREFOS_CudaParallelRows.cu
   )
 else()
   list(APPEND PREFOS_SOURCES

@@ -112,6 +112,8 @@ class Settings(ct.Structure):
         ("parallel_column_reduction", ct.c_int),
         ("remove_redundant_bounds", ct.c_int),
         ("structural_reductions_gpu", ct.c_int),
+        ("parallel_row_max_average_nnz", ct.c_double),
+        ("redundant_row_max_average_nnz", ct.c_double),
     ]
 
 

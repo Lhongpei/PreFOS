@@ -5,6 +5,7 @@
 
 #include "PREFOS_LinearPropagation.h"
 #include "PREFOS_ConeActivity.h"
+#include "PREFOS_CudaBackend.h"
 #include "PREFOS_CudaLinearPropagation.h"
 #include "core/PREFOS_Timer.h"
 #include "DirtyRows.h"
@@ -119,6 +120,22 @@ static PreFOSStatus check_row_activity(const PreFOSPresolver *presolver, size_t 
         presolver->settings.feasibility_tolerance, 0.0);
     return (state & PRESOLVE_ROW_INFEASIBLE) != 0 ? PREFOS_STATUS_PRIMAL_INFEASIBLE
                                                   : PREFOS_STATUS_OK;
+}
+
+PreFOSStatus prefos_internal_verify_linear_row_with_bounds(
+    const PreFOSPresolver *presolver, size_t row,
+    const double *lower_bounds, const double *upper_bounds)
+{
+    PreFOSRowActivity activity;
+    PreFOSStatus status;
+    if (!presolver || row >= presolver->original.A.rows || !lower_bounds ||
+        !upper_bounds)
+        return PREFOS_STATUS_INVALID_ARGUMENT;
+    status = compute_row_activity_with_bounds(
+        presolver, row, 1, lower_bounds, upper_bounds, &activity);
+    return status == PREFOS_STATUS_OK
+               ? check_row_activity(presolver, row, &activity)
+               : status;
 }
 
 static int row_is_active_for_linear_propagation(const PreFOSPresolver *presolver,
@@ -630,14 +647,10 @@ static PreFOSStatus propagate_linear_bounds_gpu(PreFOSPresolver *presolver, int 
     for (size_t row = 0; row < problem->A.rows; ++row)
         if (row_is_active_for_linear_propagation(presolver, row)) ++active_rows;
 
-    cuda_status = prefos_cuda_linear_propagation_create(
-        problem->A.rows, problem->n, problem->A.nnz, problem->A.row_pointers,
-        problem->A.column_indices, problem->A.values,
-        presolver->working_constraint_lower, presolver->working_constraint_upper,
-        presolver->variable_to_box, presolver->remove_rows, &context,
-        &presolver->stats.linear_gpu_setup_milliseconds,
-        &presolver->stats.linear_gpu_long_rows);
-    if (cuda_status != PREFOS_CUDA_PROPAGATION_OK)
+    context = prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+    presolver->stats.linear_gpu_setup_milliseconds =
+        presolver->stats.cuda_workspace_setup_milliseconds;
+    if (!context || cuda_status != PREFOS_CUDA_PROPAGATION_OK)
     {
         ++presolver->stats.linear_gpu_fallbacks;
         return propagate_linear_bounds_full_scan(presolver, max_rounds, work_limit);
@@ -652,7 +665,6 @@ static PreFOSStatus propagate_linear_bounds_gpu(PreFOSPresolver *presolver, int 
     if (problem->n > 0 &&
         (!lower_candidates || !upper_candidates || !lower_sources || !upper_sources))
     {
-        prefos_cuda_linear_propagation_free(context);
         free(lower_candidates);
         free(upper_candidates);
         free(lower_sources);
@@ -679,7 +691,9 @@ static PreFOSStatus propagate_linear_bounds_gpu(PreFOSPresolver *presolver, int 
         }
         cuda_status = prefos_cuda_linear_propagation_round(
             context, presolver->propagation_lower, presolver->propagation_upper,
-            presolver->settings.feasibility_tolerance,
+            presolver->working_constraint_lower,
+            presolver->working_constraint_upper, presolver->remove_rows,
+            NULL, presolver->settings.feasibility_tolerance,
             PRESOLVE_DEFAULT_MAX_INFERRED_BOUND_MAGNITUDE, lower_candidates,
             upper_candidates, lower_sources, upper_sources,
             &suspected_infeasible_row, &transfer_milliseconds, &kernel_milliseconds);
@@ -689,7 +703,6 @@ static PreFOSStatus propagate_linear_bounds_gpu(PreFOSPresolver *presolver, int 
         {
             int remaining_rounds = max_rounds - completed_rounds;
             ++presolver->stats.linear_gpu_fallbacks;
-            prefos_cuda_linear_propagation_free(context);
             free(lower_candidates);
             free(upper_candidates);
             free(lower_sources);
@@ -730,7 +743,6 @@ static PreFOSStatus propagate_linear_bounds_gpu(PreFOSPresolver *presolver, int 
         }
         if (status != PREFOS_STATUS_OK)
         {
-            prefos_cuda_linear_propagation_free(context);
             free(lower_candidates);
             free(upper_candidates);
             free(lower_sources);
@@ -754,7 +766,6 @@ static PreFOSStatus propagate_linear_bounds_gpu(PreFOSPresolver *presolver, int 
             }
         }
     }
-    prefos_cuda_linear_propagation_free(context);
     free(lower_candidates);
     free(upper_candidates);
     free(lower_sources);
@@ -881,9 +892,23 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
     double *retained_lower = NULL, *retained_upper = NULL;
     const double *activity_lower = presolver->propagation_lower;
     const double *activity_upper = presolver->propagation_upper;
+    unsigned char *gpu_row_flags = NULL;
     PreFOSStatus result;
     size_t row, box_position;
+    int gpu_activity_valid = 0;
+    int over_cpu_budget;
     if (!presolver->settings.remove_redundant_rows) return PREFOS_STATUS_OK;
+    over_cpu_budget =
+        presolver->settings.redundant_row_max_average_nnz > 0.0 &&
+        (long double) problem->A.nnz >
+            (long double) problem->A.rows *
+                (long double)
+                    presolver->settings.redundant_row_max_average_nnz;
+    if (over_cpu_budget && !presolver->settings.structural_reductions_gpu)
+    {
+        ++presolver->stats.redundant_row_activity_budget_skips;
+        return PREFOS_STATUS_OK;
+    }
     memset(&workspace, 0, sizeof(workspace));
     result = PREFOS_STATUS_OK;
     if (presolver->settings.propagated_bound_policy ==
@@ -925,6 +950,48 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
         workspace.lower_bounds = activity_lower;
         workspace.upper_bounds = activity_upper;
     }
+    if (presolver->settings.structural_reductions_gpu)
+    {
+        PreFOSCudaPropagationStatus cuda_status;
+        PreFOSCudaWorkspace *cuda_workspace;
+        double gpu_milliseconds = 0.0;
+        gpu_row_flags = (unsigned char *) prefos_internal_alloc_array(
+            problem->A.rows, sizeof(unsigned char));
+        if (problem->A.rows > 0 && !gpu_row_flags)
+        {
+            result = PREFOS_STATUS_OUT_OF_MEMORY;
+            goto cleanup;
+        }
+        cuda_workspace =
+            prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+        if (cuda_workspace && cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+        {
+            cuda_status = prefos_cuda_cone_activity_candidates(
+                cuda_workspace, activity_lower, activity_upper,
+                presolver->working_constraint_lower,
+                presolver->working_constraint_upper, presolver->remove_rows,
+                presolver->settings.feasibility_tolerance, gpu_row_flags,
+                &gpu_milliseconds);
+        }
+        presolver->stats.cone_activity_gpu_milliseconds += gpu_milliseconds;
+        if (cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+        {
+            gpu_activity_valid = 1;
+            ++presolver->stats.cone_activity_gpu_passes;
+            for (row = 0; row < problem->A.rows; ++row)
+                if (gpu_row_flags[row] != 0)
+                    ++presolver->stats.cone_activity_gpu_candidates;
+        }
+        else
+        {
+            ++presolver->stats.cone_activity_gpu_fallbacks;
+            if (over_cpu_budget)
+            {
+                ++presolver->stats.redundant_row_activity_budget_skips;
+                goto cleanup;
+            }
+        }
+    }
 
     for (row = 0; row < problem->A.rows; ++row)
     {
@@ -934,6 +1001,7 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
         PresolveLinearRowState row_state;
         PreFOSStatus status;
         if (presolver->remove_rows[row]) continue;
+        if (gpu_activity_valid && gpu_row_flags[row] == 0) continue;
         if (!isfinite(presolver->working_constraint_lower[row]) &&
             !isfinite(presolver->working_constraint_upper[row]))
         {
@@ -1004,7 +1072,9 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
             ++presolver->stats.removed_redundant_row_upper_sides;
         }
     }
+cleanup:
     prefos_internal_cone_activity_workspace_free(&workspace);
+    free(gpu_row_flags);
     free(retained_lower);
     free(retained_upper);
     return result;

@@ -30,7 +30,7 @@ direct variable domains. Affine cone rows may involve variables from any direct
 domain. A direct block `x_J in K` remains a projection-friendly primitive; it
 is the selector-matrix special case of an affine cone, but is not expanded
 unless a reduction benefits from doing so. PreFOS provides a CPU implementation
-and an experimental optional CUDA backend for bulk linear propagation. Both
+and an experimental optional CUDA backend for bulk presolve passes. Both
 backends use the same bound acceptance and postsolve semantics.
 
 ---
@@ -55,12 +55,16 @@ cmake -S . -B build-gpu -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-gpu -j
 ```
 
-Set `linear_propagation_gpu = 1` to request it. A non-CUDA build or CUDA runtime
-failure falls back to the CPU bulk engine. Sparse event-driven propagation
-always remains on CPU. CUDA 11.2 or newer is required for the asynchronous
-allocation pool. `prefos_gpu_warmup()` can initialize the primary context
-before a timed solve, while `prefos_gpu_release_cache()` trims cached device
-allocations when no presolve call is active.
+Set `linear_propagation_gpu = 1` to request bulk linear, direct-cone, and
+alternating row-to-cone envelope propagation. Set
+`structural_reductions_gpu = 1` to request GPU column statistics, parallel-row
+detection, and cone-aware row activity. These passes share one resident device
+workspace. A non-CUDA build or CUDA runtime failure
+falls back to the corresponding CPU pass; sparse event-driven propagation and
+all final reduction commits remain on CPU. CUDA 11.2 or newer is required for
+the asynchronous allocation pool. `prefos_gpu_warmup()` can initialize the
+primary context before a timed solve, while `prefos_gpu_release_cache()` trims
+cached device allocations when no presolve call is active.
 
 The public C API is defined in `include/PreFOS/PreFOS.h`. Installed CMake
 packages expose the `PreFOS::PreFOS` target:
@@ -121,8 +125,9 @@ PreFOS provides a lightweight, solver-oriented presolve pipeline:
   elimination and compaction.
 - Ordered transformation records support primal, primal-dual, and extended-dual
   postsolve together with independent equivalence and KKT verification.
-- Linear propagation uses a hybrid event-driven and bulk CPU engine, with an
-  optional CUDA bulk backend and optional CUDA column statistics.
+- Linear and cone propagation use hybrid event-driven and bulk CPU engines,
+  with an optional shared-workspace CUDA backend for bulk propagation and
+  structural candidate detection.
 
 The full reduction contracts, settings, GPU design, correctness harnesses, and
 benchmark entry points are documented in

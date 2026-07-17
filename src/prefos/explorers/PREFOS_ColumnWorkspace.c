@@ -4,6 +4,7 @@
  */
 
 #include "PREFOS_ColumnReductionInternal.h"
+#include "PREFOS_CudaBackend.h"
 #include "PREFOS_CudaLinearPropagation.h"
 
 void prefos_internal_free_column_workspace(PreFOSColumnWorkspace *workspace)
@@ -134,6 +135,7 @@ PreFOSStatus prefos_internal_populate_gpu_column_stats(
 {
     const PreFOSProblemData *problem = &presolver->original;
     PreFOSCudaPropagationStatus cuda_status;
+    PreFOSCudaWorkspace *cuda_workspace;
     double milliseconds = 0.0;
     if (!presolver->settings.structural_reductions_gpu) return PREFOS_STATUS_OK;
     workspace->gpu_degrees =
@@ -146,13 +148,14 @@ PreFOSStatus prefos_internal_populate_gpu_column_stats(
         (!workspace->gpu_degrees || !workspace->gpu_down_locked ||
          !workspace->gpu_up_locked))
         return PREFOS_STATUS_OUT_OF_MEMORY;
-    cuda_status = prefos_cuda_linear_column_stats(
-        problem->A.rows, problem->n, problem->A.nnz, problem->A.row_pointers,
-        problem->A.column_indices, problem->A.values,
-        presolver->working_constraint_lower,
-        presolver->working_constraint_upper, presolver->remove_rows,
-        workspace->gpu_degrees, workspace->gpu_down_locked,
-        workspace->gpu_up_locked, &milliseconds);
+    cuda_workspace =
+        prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+    if (cuda_workspace && cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+        cuda_status = prefos_cuda_workspace_column_stats(
+            cuda_workspace, presolver->working_constraint_lower,
+            presolver->working_constraint_upper, presolver->remove_rows,
+            workspace->gpu_degrees, workspace->gpu_down_locked,
+            workspace->gpu_up_locked, &milliseconds);
     if (cuda_status == PREFOS_CUDA_PROPAGATION_OK)
     {
         workspace->gpu_stats_valid = 1;

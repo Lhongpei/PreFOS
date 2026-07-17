@@ -4,6 +4,7 @@
  */
 
 #include "PREFOS_CudaLinearPropagation.h"
+#include "PREFOS_CudaWorkspaceInternal.cuh"
 
 #include <cub/block/block_reduce.cuh>
 #include <cuda_runtime.h>
@@ -18,30 +19,6 @@
 #include <new>
 #include <thread>
 #include <utility>
-
-struct PreFOSCudaLinearPropagationContext
-{
-    cudaStream_t stream;
-    size_t rows;
-    size_t columns;
-    size_t n_long_rows;
-    int *row_pointers;
-    int *column_indices;
-    double *values;
-    double *constraint_lower;
-    double *constraint_upper;
-    int *candidate_map;
-    unsigned char *remove_rows;
-    double *lower_bounds;
-    double *upper_bounds;
-    double *lower_candidates;
-    double *upper_candidates;
-    int *lower_source_rows;
-    int *upper_source_rows;
-    int *long_rows;
-    int *suspected_infeasible_row;
-    int *numerical_error;
-};
 
 namespace
 {
@@ -185,6 +162,16 @@ void free_context(PreFOSCudaLinearPropagationContext *context)
         cudaFreeAsync(context->long_rows, context->stream);
         cudaFreeAsync(context->suspected_infeasible_row, context->stream);
         cudaFreeAsync(context->numerical_error, context->stream);
+        cudaFreeAsync(context->cone_types, context->stream);
+        cudaFreeAsync(context->cone_starts, context->stream);
+        cudaFreeAsync(context->cone_indices, context->stream);
+        cudaFreeAsync(context->cone_matrix_orders, context->stream);
+        cudaFreeAsync(context->cone_power_alphas, context->stream);
+        cudaFreeAsync(context->column_to_cone, context->stream);
+        cudaFreeAsync(context->column_to_cone_position, context->stream);
+        cudaFreeAsync(context->cone_activity_group_keys, context->stream);
+        cudaFreeAsync(context->cone_activity_group_offsets, context->stream);
+        cudaFreeAsync(context->cone_activity_sorted_positions, context->stream);
         cudaStreamSynchronize(context->stream);
         cudaStreamDestroy(context->stream);
     }
@@ -407,16 +394,120 @@ cleanup:
 #undef PREFOS_CUDA_STATS_CHECK
 }
 
-extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_create(
-    size_t rows, size_t columns, size_t nnz, const int *row_pointers,
-    const int *column_indices, const double *values, const double *constraint_lower,
-    const double *constraint_upper, const int *candidate_map,
-    const unsigned char *remove_rows, PreFOSCudaLinearPropagationContext **output,
-    double *setup_milliseconds, size_t *long_rows)
+extern "C" PreFOSCudaPropagationStatus prefos_cuda_workspace_column_stats(
+    PreFOSCudaWorkspace *context, const double *constraint_lower,
+    const double *constraint_upper, const unsigned char *remove_rows,
+    int *column_degrees, unsigned char *down_locked,
+    unsigned char *up_locked, double *milliseconds)
 {
     using Clock = std::chrono::steady_clock;
     auto start = Clock::now();
-    PreFOSCudaLinearPropagationContext *context;
+    int *device_degrees = nullptr, *device_down_locked = nullptr;
+    int *device_up_locked = nullptr;
+    int *host_down_locked = nullptr, *host_up_locked = nullptr;
+    cudaError_t cuda_status = cudaSuccess;
+    PreFOSCudaPropagationStatus result = PREFOS_CUDA_PROPAGATION_OK;
+
+    if (milliseconds) *milliseconds = 0.0;
+    if (!context || !constraint_lower || !constraint_upper || !remove_rows ||
+        !column_degrees || !down_locked || !up_locked ||
+        context->rows > static_cast<size_t>(UINT_MAX))
+        return PREFOS_CUDA_PROPAGATION_ERROR;
+    host_down_locked = new (std::nothrow) int[context->columns];
+    host_up_locked = new (std::nothrow) int[context->columns];
+    if (context->columns > 0 && (!host_down_locked || !host_up_locked))
+    {
+        result = PREFOS_CUDA_PROPAGATION_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+
+#define PREFOS_CUDA_WORKSPACE_STATS_CHECK(call)                              \
+    do                                                                        \
+    {                                                                         \
+        cuda_status = (call);                                                 \
+        if (cuda_status != cudaSuccess)                                       \
+        {                                                                     \
+            result = status_from_cuda(cuda_status);                           \
+            goto cleanup;                                                     \
+        }                                                                     \
+    } while (0)
+
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(copy_to_device(
+        context->constraint_lower, constraint_lower, context->rows,
+        context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(copy_to_device(
+        context->constraint_upper, constraint_upper, context->rows,
+        context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(copy_to_device(
+        context->remove_rows, remove_rows, context->rows, context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(
+        allocate_device(&device_degrees, context->columns, context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(allocate_device(
+        &device_down_locked, context->columns, context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(allocate_device(
+        &device_up_locked, context->columns, context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(cudaMemsetAsync(
+        device_degrees, 0, context->columns * sizeof(int), context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(cudaMemsetAsync(
+        device_down_locked, 0, context->columns * sizeof(int),
+        context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(cudaMemsetAsync(
+        device_up_locked, 0, context->columns * sizeof(int),
+        context->stream));
+    if (context->rows > 0)
+    {
+        column_stats_kernel<<<static_cast<unsigned int>(context->rows),
+                              kThreads, 0, context->stream>>>(
+            context->rows, context->row_pointers, context->column_indices,
+            context->values, context->constraint_lower,
+            context->constraint_upper, context->remove_rows, device_degrees,
+            device_down_locked, device_up_locked);
+        PREFOS_CUDA_WORKSPACE_STATS_CHECK(cudaGetLastError());
+    }
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(copy_to_host(
+        column_degrees, device_degrees, context->columns, context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(copy_to_host(
+        host_down_locked, device_down_locked, context->columns,
+        context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(copy_to_host(
+        host_up_locked, device_up_locked, context->columns, context->stream));
+    PREFOS_CUDA_WORKSPACE_STATS_CHECK(cudaStreamSynchronize(context->stream));
+    for (size_t column = 0; column < context->columns; ++column)
+    {
+        down_locked[column] =
+            static_cast<unsigned char>(host_down_locked[column] != 0);
+        up_locked[column] =
+            static_cast<unsigned char>(host_up_locked[column] != 0);
+    }
+
+cleanup:
+    cudaFreeAsync(device_degrees, context->stream);
+    cudaFreeAsync(device_down_locked, context->stream);
+    cudaFreeAsync(device_up_locked, context->stream);
+    (void) cudaStreamSynchronize(context->stream);
+    delete[] host_down_locked;
+    delete[] host_up_locked;
+    if (milliseconds)
+        *milliseconds =
+            std::chrono::duration<double, std::milli>(Clock::now() - start)
+                .count();
+    return result;
+#undef PREFOS_CUDA_WORKSPACE_STATS_CHECK
+}
+
+extern "C" PreFOSCudaPropagationStatus prefos_cuda_workspace_create(
+    size_t rows, size_t columns, size_t nnz, const int *row_pointers,
+    const int *column_indices, const double *values, const double *constraint_lower,
+    const double *constraint_upper, const int *candidate_map,
+    const unsigned char *remove_rows, size_t n_cones, const int *cone_types,
+    const int *cone_starts, const int *cone_indices,
+    const int *cone_matrix_orders, const double *cone_power_alphas,
+    const int *column_to_cone, const int *column_to_cone_position,
+    PreFOSCudaWorkspace **output, double *setup_milliseconds, size_t *long_rows)
+{
+    using Clock = std::chrono::steady_clock;
+    auto start = Clock::now();
+    PreFOSCudaWorkspace *context;
     int *host_long_rows = nullptr;
     cudaError_t status;
     PreFOSCudaPropagationStatus warmup_status;
@@ -427,10 +518,14 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_create(
     if (long_rows) *long_rows = 0;
     warmup_status = prefos_cuda_linear_propagation_warmup();
     if (warmup_status != PREFOS_CUDA_PROPAGATION_OK) return warmup_status;
-    context = new (std::nothrow) PreFOSCudaLinearPropagationContext{};
+    context = new (std::nothrow) PreFOSCudaWorkspace{};
     if (!context) return PREFOS_CUDA_PROPAGATION_OUT_OF_MEMORY;
     context->rows = rows;
     context->columns = columns;
+    context->nnz = nnz;
+    context->n_cones = n_cones;
+    context->n_cone_indices =
+        n_cones > 0 && cone_starts ? static_cast<size_t>(cone_starts[n_cones]) : 0;
 
 #define PREFOS_CUDA_CHECK(call)                                                        \
     do                                                                              \
@@ -485,6 +580,23 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_create(
     PREFOS_CUDA_CHECK(
         allocate_device(&context->suspected_infeasible_row, 1, context->stream));
     PREFOS_CUDA_CHECK(allocate_device(&context->numerical_error, 1, context->stream));
+    PREFOS_CUDA_CHECK(
+        allocate_device(&context->cone_types, n_cones, context->stream));
+    PREFOS_CUDA_CHECK(
+        allocate_device(&context->cone_starts, n_cones > 0 ? n_cones + 1 : 0,
+                        context->stream));
+    PREFOS_CUDA_CHECK(allocate_device(&context->cone_indices,
+                                      context->n_cone_indices, context->stream));
+    PREFOS_CUDA_CHECK(
+        allocate_device(&context->cone_matrix_orders, n_cones, context->stream));
+    PREFOS_CUDA_CHECK(
+        allocate_device(&context->cone_power_alphas, n_cones, context->stream));
+    PREFOS_CUDA_CHECK(
+        allocate_device(&context->column_to_cone, n_cones > 0 ? columns : 0,
+                        context->stream));
+    PREFOS_CUDA_CHECK(allocate_device(&context->column_to_cone_position,
+                                      n_cones > 0 ? columns : 0,
+                                      context->stream));
 
     PREFOS_CUDA_CHECK(copy_to_device(context->row_pointers, row_pointers, rows + 1,
                                   context->stream));
@@ -501,6 +613,26 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_create(
         copy_to_device(context->remove_rows, remove_rows, rows, context->stream));
     PREFOS_CUDA_CHECK(copy_to_device(context->long_rows, host_long_rows,
                                   context->n_long_rows, context->stream));
+    PREFOS_CUDA_CHECK(
+        copy_to_device(context->cone_types, cone_types, n_cones, context->stream));
+    PREFOS_CUDA_CHECK(copy_to_device(context->cone_starts, cone_starts,
+                                     n_cones > 0 ? n_cones + 1 : 0,
+                                     context->stream));
+    PREFOS_CUDA_CHECK(copy_to_device(context->cone_indices, cone_indices,
+                                     context->n_cone_indices, context->stream));
+    PREFOS_CUDA_CHECK(copy_to_device(context->cone_matrix_orders,
+                                     cone_matrix_orders, n_cones,
+                                     context->stream));
+    PREFOS_CUDA_CHECK(copy_to_device(context->cone_power_alphas,
+                                     cone_power_alphas, n_cones,
+                                     context->stream));
+    PREFOS_CUDA_CHECK(copy_to_device(context->column_to_cone, column_to_cone,
+                                     n_cones > 0 ? columns : 0,
+                                     context->stream));
+    PREFOS_CUDA_CHECK(copy_to_device(context->column_to_cone_position,
+                                     column_to_cone_position,
+                                     n_cones > 0 ? columns : 0,
+                                     context->stream));
     PREFOS_CUDA_CHECK(cudaStreamSynchronize(context->stream));
     delete[] host_long_rows;
     host_long_rows = nullptr;
@@ -513,9 +645,26 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_create(
 #undef PREFOS_CUDA_CHECK
 }
 
+extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_create(
+    size_t rows, size_t columns, size_t nnz, const int *row_pointers,
+    const int *column_indices, const double *values,
+    const double *constraint_lower, const double *constraint_upper,
+    const int *candidate_map, const unsigned char *remove_rows,
+    PreFOSCudaLinearPropagationContext **output, double *setup_milliseconds,
+    size_t *long_rows)
+{
+    return prefos_cuda_workspace_create(
+        rows, columns, nnz, row_pointers, column_indices, values,
+        constraint_lower, constraint_upper, candidate_map, remove_rows, 0,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, output,
+        setup_milliseconds, long_rows);
+}
+
 extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_round(
     PreFOSCudaLinearPropagationContext *context, const double *lower_bounds,
-    const double *upper_bounds, double feasibility_tolerance,
+    const double *upper_bounds, const double *constraint_lower,
+    const double *constraint_upper, const unsigned char *remove_rows,
+    const int *candidate_map, double feasibility_tolerance,
     double maximum_inferred_bound_magnitude, double *lower_candidates,
     double *upper_candidates, int *lower_source_rows, int *upper_source_rows,
     int *suspected_infeasible_row, double *transfer_milliseconds,
@@ -551,6 +700,18 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_round(
                                         context->columns, context->stream));
     PREFOS_CUDA_ROUND_CHECK(copy_to_device(context->upper_bounds, upper_bounds,
                                         context->columns, context->stream));
+    PREFOS_CUDA_ROUND_CHECK(copy_to_device(context->constraint_lower,
+                                           constraint_lower, context->rows,
+                                           context->stream));
+    PREFOS_CUDA_ROUND_CHECK(copy_to_device(context->constraint_upper,
+                                           constraint_upper, context->rows,
+                                           context->stream));
+    PREFOS_CUDA_ROUND_CHECK(copy_to_device(context->remove_rows, remove_rows,
+                                           context->rows, context->stream));
+    if (candidate_map)
+        PREFOS_CUDA_ROUND_CHECK(copy_to_device(
+            context->candidate_map, candidate_map, context->columns,
+            context->stream));
     PREFOS_CUDA_ROUND_CHECK(cudaEventCreate(&kernel_start));
     PREFOS_CUDA_ROUND_CHECK(cudaEventCreate(&kernel_stop));
     PREFOS_CUDA_ROUND_CHECK(cudaEventRecord(kernel_start, context->stream));
@@ -649,6 +810,11 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_round(
 
 extern "C" void
 prefos_cuda_linear_propagation_free(PreFOSCudaLinearPropagationContext *context)
+{
+    free_context(context);
+}
+
+extern "C" void prefos_cuda_workspace_free(PreFOSCudaWorkspace *context)
 {
     free_context(context);
 }
