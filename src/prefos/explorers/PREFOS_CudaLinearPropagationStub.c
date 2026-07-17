@@ -27,6 +27,29 @@ PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_warmup_wait(void)
 
 void prefos_cuda_linear_propagation_release_cache(void) {}
 
+PreFOSCudaPropagationStatus prefos_cuda_linear_column_stats(
+    size_t rows, size_t columns, size_t nnz, const int *row_pointers,
+    const int *column_indices, const double *values,
+    const double *constraint_lower, const double *constraint_upper,
+    const unsigned char *remove_rows, int *column_degrees,
+    unsigned char *down_locked, unsigned char *up_locked, double *milliseconds)
+{
+    (void) rows;
+    (void) columns;
+    (void) nnz;
+    (void) row_pointers;
+    (void) column_indices;
+    (void) values;
+    (void) constraint_lower;
+    (void) constraint_upper;
+    (void) remove_rows;
+    (void) column_degrees;
+    (void) down_locked;
+    (void) up_locked;
+    if (milliseconds) *milliseconds = 0.0;
+    return PREFOS_CUDA_PROPAGATION_UNAVAILABLE;
+}
+
 PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_create(
     size_t rows, size_t columns, size_t nnz, const int *row_pointers,
     const int *column_indices, const double *values, const double *constraint_lower,

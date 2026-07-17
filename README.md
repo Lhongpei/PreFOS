@@ -111,8 +111,9 @@ attribution.
 PreFOS provides a lightweight, solver-oriented presolve pipeline:
 
 - Linear reductions include validation, fixed-variable elimination, singleton
-  tightening, activity propagation, redundant-row removal, parallel-row
-  reduction, and bounded equality aggregation.
+  tightening, activity propagation, empty/singleton/parallel-column rules,
+  dual fixing, row-side and box-bound redundancy, parallel-row reduction, and
+  bounded equality aggregation.
 - Cone reductions cover nonnegative, SOC, rotated SOC, PSD, exponential, and
   power cones, including conservative envelope propagation, exact exposed-face
   reductions, and affine-cone structure analysis.
@@ -121,7 +122,7 @@ PreFOS provides a lightweight, solver-oriented presolve pipeline:
 - Ordered transformation records support primal, primal-dual, and extended-dual
   postsolve together with independent equivalence and KKT verification.
 - Linear propagation uses a hybrid event-driven and bulk CPU engine, with an
-  optional CUDA bulk backend.
+  optional CUDA bulk backend and optional CUDA column statistics.
 
 The full reduction contracts, settings, GPU design, correctness harnesses, and
 benchmark entry points are documented in

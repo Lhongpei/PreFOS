@@ -61,10 +61,18 @@ set(PREFOS_SOURCES
   src/prefos/explorers/PREFOS_AffineFaceSubstitution.c
   src/prefos/explorers/PREFOS_ConeActivity.c
   src/prefos/explorers/PREFOS_ConePropagation.c
+  src/prefos/explorers/PREFOS_BoundedDoubletons.c
+  src/prefos/explorers/PREFOS_ColumnFixing.c
+  src/prefos/explorers/PREFOS_ColumnReductions.c
+  src/prefos/explorers/PREFOS_ColumnSubstitution.c
+  src/prefos/explorers/PREFOS_ColumnWorkspace.c
   src/prefos/explorers/PREFOS_FreeColumnSubstitution.c
   src/prefos/explorers/PREFOS_LinearPropagation.c
+  src/prefos/explorers/PREFOS_ParallelColumns.c
   src/prefos/explorers/PREFOS_ParallelRows.c
+  src/prefos/explorers/PREFOS_RedundantBounds.c
   src/prefos/explorers/PREFOS_SDPStructureAnalysis.c
+  src/prefos/explorers/PREFOS_SingletonColumns.c
 )
 
 if(PREFOS_ENABLE_CUDA)
@@ -155,6 +163,10 @@ if(PREFOS_BUILD_TESTING)
   target_link_libraries(prefos_tests PRIVATE PreFOS::PreFOS)
   add_test(NAME prefos_tests COMMAND prefos_tests)
 
+  add_executable(prefos_column_reduction_tests tests/test_column_reductions.c)
+  target_link_libraries(prefos_column_reduction_tests PRIVATE PreFOS::PreFOS)
+  add_test(NAME prefos_column_reduction_tests COMMAND prefos_column_reduction_tests)
+
   add_executable(prefos_cpp_tests tests/test_prefos_cpp.cpp)
   target_compile_features(prefos_cpp_tests PRIVATE cxx_std_11)
   target_link_libraries(prefos_cpp_tests PRIVATE PreFOS::PreFOS)
@@ -163,6 +175,8 @@ if(PREFOS_BUILD_TESTING)
   if(PREFOS_ENABLE_COVERAGE)
     target_compile_options(prefos_tests PRIVATE -O0 -g --coverage)
     target_link_options(prefos_tests PRIVATE --coverage)
+    target_compile_options(prefos_column_reduction_tests PRIVATE -O0 -g --coverage)
+    target_link_options(prefos_column_reduction_tests PRIVATE --coverage)
   endif()
 endif()
 

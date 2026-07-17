@@ -374,7 +374,20 @@ static PreFOSStatus validate_problem(const PreFOSProblemData *problem,
         (settings->psd_structure_analysis != 0 &&
          settings->psd_structure_analysis != 1) ||
         (settings->psd_block_decomposition != 0 &&
-         settings->psd_block_decomposition != 1))
+         settings->psd_block_decomposition != 1) ||
+        (settings->remove_empty_columns != 0 &&
+         settings->remove_empty_columns != 1) ||
+        (settings->singleton_column_reduction != 0 &&
+         settings->singleton_column_reduction != 1) ||
+        (settings->bounded_doubleton_substitution != 0 &&
+         settings->bounded_doubleton_substitution != 1) ||
+        (settings->dual_fixing != 0 && settings->dual_fixing != 1) ||
+        (settings->parallel_column_reduction != 0 &&
+         settings->parallel_column_reduction != 1) ||
+        (settings->remove_redundant_bounds != 0 &&
+         settings->remove_redundant_bounds != 1) ||
+        (settings->structural_reductions_gpu != 0 &&
+         settings->structural_reductions_gpu != 1))
     {
         return PREFOS_STATUS_INVALID_ARGUMENT;
     }
@@ -786,6 +799,13 @@ PreFOSSettings prefos_default_settings(void)
     settings.affine_cone_coordinate_aggregation = 0;
     settings.psd_structure_analysis = 1;
     settings.psd_block_decomposition = 1;
+    settings.remove_empty_columns = 1;
+    settings.singleton_column_reduction = 1;
+    settings.bounded_doubleton_substitution = 0;
+    settings.dual_fixing = 1;
+    settings.parallel_column_reduction = 1;
+    settings.remove_redundant_bounds = 1;
+    settings.structural_reductions_gpu = 0;
     return settings;
 }
 
@@ -852,9 +872,12 @@ void prefos_free_presolver(PreFOSPresolver *presolver)
     free(presolver->fixed_values);
     free(presolver->is_fixed);
     free(presolver->is_substituted);
+    free(presolver->is_parallel_removed);
     free(presolver->substitution_term_count);
     free(presolver->substitution_incoming_depth);
+    free(presolver->substitution_keeps_source_row);
     free(presolver->substitution_term_start);
+    free(presolver->substitution_source_row);
     free(presolver->substitution_constant);
     free(presolver->substitution_targets);
     free(presolver->substitution_scales);

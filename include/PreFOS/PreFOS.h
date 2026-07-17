@@ -37,7 +37,8 @@ extern "C"
         PREFOS_STATUS_INVALID_ARGUMENT,
         PREFOS_STATUS_NUMERICAL_ERROR,
         PREFOS_STATUS_OUT_OF_MEMORY,
-        PREFOS_STATUS_DUAL_RECOVERY_UNAVAILABLE
+        PREFOS_STATUS_DUAL_RECOVERY_UNAVAILABLE,
+        PREFOS_STATUS_PRIMAL_UNBOUNDED
     } PreFOSStatus;
 
     typedef enum
@@ -204,6 +205,16 @@ extern "C"
         int psd_structure_analysis;
         /* Split exactly block-diagonal affine PSD images into PSD components. */
         int psd_block_decomposition;
+        /* LP-style column reductions; nonlinear and coupled columns are skipped. */
+        int remove_empty_columns;
+        int singleton_column_reduction;
+        int bounded_doubleton_substitution;
+        int dual_fixing;
+        int parallel_column_reduction;
+        /* Remove row-implied box sides in the interior-point bound policy. */
+        int remove_redundant_bounds;
+        /* Use CUDA for structural column statistics when available. */
+        int structural_reductions_gpu;
     } PreFOSSettings;
 
     /*
@@ -350,6 +361,19 @@ extern "C"
         size_t fixed_affine_face_variables;
         size_t substituted_affine_face_variables;
         double affine_face_substitution_milliseconds;
+        size_t removed_empty_columns;
+        size_t removed_singleton_columns;
+        size_t tightened_singleton_rows;
+        size_t substituted_bounded_doubletons;
+        size_t dual_fixed_columns;
+        size_t merged_parallel_columns;
+        size_t removed_redundant_row_lower_sides;
+        size_t removed_redundant_row_upper_sides;
+        size_t removed_redundant_box_lower_bounds;
+        size_t removed_redundant_box_upper_bounds;
+        size_t structural_gpu_passes;
+        size_t structural_gpu_fallbacks;
+        double structural_reduction_milliseconds;
     } PreFOSStats;
 
     typedef struct
@@ -499,7 +523,8 @@ extern "C"
      * stationarity is grad(f) + A^T y + z = 0. Cone entries of -z lie in the
      * corresponding dual cone. This API returns
      * PREFOS_STATUS_DUAL_RECOVERY_UNAVAILABLE when the original or reduced model
-     * has affine cone blocks, whose row duals require a separate vector.
+     * has affine cone blocks, whose row duals require a separate vector, or
+     * when an enabled structural reduction has only primal recovery support.
      */
     PREFOS_API PreFOSStatus prefos_postsolve_primal_dual(
         const PreFOSPresolver *presolver, const double *reduced_x,

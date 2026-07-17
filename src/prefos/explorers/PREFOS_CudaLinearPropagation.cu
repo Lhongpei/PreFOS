@@ -84,6 +84,36 @@ PreFOSCudaPropagationStatus status_from_cuda(cudaError_t status)
     return PREFOS_CUDA_PROPAGATION_ERROR;
 }
 
+__global__ void column_stats_kernel(
+    size_t rows, const int *row_pointers, const int *column_indices,
+    const double *values, const double *constraint_lower,
+    const double *constraint_upper, const unsigned char *remove_rows,
+    int *column_degrees, int *down_locked, int *up_locked)
+{
+    size_t row = static_cast<size_t>(blockIdx.x);
+    if (row >= rows || remove_rows[row]) return;
+    bool finite_lower = isfinite(constraint_lower[row]);
+    bool finite_upper = isfinite(constraint_upper[row]);
+    for (int p = row_pointers[row] + static_cast<int>(threadIdx.x);
+         p < row_pointers[row + 1]; p += static_cast<int>(blockDim.x))
+    {
+        int column = column_indices[p];
+        double coefficient = values[p];
+        if (coefficient == 0.0) continue;
+        atomicAdd(column_degrees + column, 1);
+        if (coefficient > 0.0)
+        {
+            if (finite_lower) atomicExch(down_locked + column, 1);
+            if (finite_upper) atomicExch(up_locked + column, 1);
+        }
+        else
+        {
+            if (finite_upper) atomicExch(down_locked + column, 1);
+            if (finite_lower) atomicExch(up_locked + column, 1);
+        }
+    }
+}
+
 #include "PREFOS_CudaLinearPropagationKernels.cuh"
 
 enum class WarmupPhase
@@ -250,6 +280,131 @@ extern "C" void prefos_cuda_linear_propagation_release_cache(void)
     (void) cudaMemPoolTrimTo(pool, 0);
     (void) cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
                                    &retained_threshold);
+}
+
+extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_column_stats(
+    size_t rows, size_t columns, size_t nnz, const int *row_pointers,
+    const int *column_indices, const double *values,
+    const double *constraint_lower, const double *constraint_upper,
+    const unsigned char *remove_rows, int *column_degrees,
+    unsigned char *down_locked, unsigned char *up_locked, double *milliseconds)
+{
+    using Clock = std::chrono::steady_clock;
+    auto start = Clock::now();
+    cudaStream_t stream = nullptr;
+    int *device_row_pointers = nullptr;
+    int *device_column_indices = nullptr;
+    double *device_values = nullptr;
+    double *device_lower = nullptr;
+    double *device_upper = nullptr;
+    unsigned char *device_remove_rows = nullptr;
+    int *device_degrees = nullptr;
+    int *device_down_locked = nullptr;
+    int *device_up_locked = nullptr;
+    int *host_down_locked = nullptr;
+    int *host_up_locked = nullptr;
+    cudaError_t cuda_status = cudaSuccess;
+    PreFOSCudaPropagationStatus result = PREFOS_CUDA_PROPAGATION_OK;
+
+    if (milliseconds) *milliseconds = 0.0;
+    if ((rows > 0 && (!row_pointers || !constraint_lower || !constraint_upper ||
+                      !remove_rows)) ||
+        (nnz > 0 && (!column_indices || !values)) ||
+        (columns > 0 && (!column_degrees || !down_locked || !up_locked)) ||
+        rows > static_cast<size_t>(UINT_MAX))
+        return PREFOS_CUDA_PROPAGATION_ERROR;
+    result = prefos_cuda_linear_propagation_warmup();
+    if (result != PREFOS_CUDA_PROPAGATION_OK) return result;
+    host_down_locked = new (std::nothrow) int[columns];
+    host_up_locked = new (std::nothrow) int[columns];
+    if (columns > 0 && (!host_down_locked || !host_up_locked))
+    {
+        result = PREFOS_CUDA_PROPAGATION_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+
+#define PREFOS_CUDA_STATS_CHECK(call)                                               \
+    do                                                                              \
+    {                                                                               \
+        cuda_status = (call);                                                       \
+        if (cuda_status != cudaSuccess)                                             \
+        {                                                                           \
+            result = status_from_cuda(cuda_status);                                 \
+            goto cleanup;                                                           \
+        }                                                                           \
+    } while (0)
+
+    PREFOS_CUDA_STATS_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    PREFOS_CUDA_STATS_CHECK(allocate_device(&device_row_pointers, rows + 1, stream));
+    PREFOS_CUDA_STATS_CHECK(allocate_device(&device_column_indices, nnz, stream));
+    PREFOS_CUDA_STATS_CHECK(allocate_device(&device_values, nnz, stream));
+    PREFOS_CUDA_STATS_CHECK(allocate_device(&device_lower, rows, stream));
+    PREFOS_CUDA_STATS_CHECK(allocate_device(&device_upper, rows, stream));
+    PREFOS_CUDA_STATS_CHECK(allocate_device(&device_remove_rows, rows, stream));
+    PREFOS_CUDA_STATS_CHECK(allocate_device(&device_degrees, columns, stream));
+    PREFOS_CUDA_STATS_CHECK(allocate_device(&device_down_locked, columns, stream));
+    PREFOS_CUDA_STATS_CHECK(allocate_device(&device_up_locked, columns, stream));
+    PREFOS_CUDA_STATS_CHECK(
+        copy_to_device(device_row_pointers, row_pointers, rows + 1, stream));
+    PREFOS_CUDA_STATS_CHECK(
+        copy_to_device(device_column_indices, column_indices, nnz, stream));
+    PREFOS_CUDA_STATS_CHECK(copy_to_device(device_values, values, nnz, stream));
+    PREFOS_CUDA_STATS_CHECK(copy_to_device(device_lower, constraint_lower, rows, stream));
+    PREFOS_CUDA_STATS_CHECK(copy_to_device(device_upper, constraint_upper, rows, stream));
+    PREFOS_CUDA_STATS_CHECK(
+        copy_to_device(device_remove_rows, remove_rows, rows, stream));
+    if (columns > 0)
+    {
+        PREFOS_CUDA_STATS_CHECK(cudaMemsetAsync(device_degrees, 0,
+                                                columns * sizeof(int), stream));
+        PREFOS_CUDA_STATS_CHECK(cudaMemsetAsync(device_down_locked, 0,
+                                                columns * sizeof(int), stream));
+        PREFOS_CUDA_STATS_CHECK(cudaMemsetAsync(device_up_locked, 0,
+                                                columns * sizeof(int), stream));
+    }
+    if (rows > 0)
+    {
+        column_stats_kernel<<<static_cast<unsigned int>(rows), kThreads, 0, stream>>>(
+            rows, device_row_pointers, device_column_indices, device_values,
+            device_lower, device_upper, device_remove_rows, device_degrees,
+            device_down_locked, device_up_locked);
+        PREFOS_CUDA_STATS_CHECK(cudaGetLastError());
+    }
+    PREFOS_CUDA_STATS_CHECK(
+        copy_to_host(column_degrees, device_degrees, columns, stream));
+    PREFOS_CUDA_STATS_CHECK(
+        copy_to_host(host_down_locked, device_down_locked, columns, stream));
+    PREFOS_CUDA_STATS_CHECK(
+        copy_to_host(host_up_locked, device_up_locked, columns, stream));
+    PREFOS_CUDA_STATS_CHECK(cudaStreamSynchronize(stream));
+    for (size_t column = 0; column < columns; ++column)
+    {
+        down_locked[column] = static_cast<unsigned char>(host_down_locked[column] != 0);
+        up_locked[column] = static_cast<unsigned char>(host_up_locked[column] != 0);
+    }
+
+cleanup:
+    if (stream)
+    {
+        cudaFreeAsync(device_row_pointers, stream);
+        cudaFreeAsync(device_column_indices, stream);
+        cudaFreeAsync(device_values, stream);
+        cudaFreeAsync(device_lower, stream);
+        cudaFreeAsync(device_upper, stream);
+        cudaFreeAsync(device_remove_rows, stream);
+        cudaFreeAsync(device_degrees, stream);
+        cudaFreeAsync(device_down_locked, stream);
+        cudaFreeAsync(device_up_locked, stream);
+        (void) cudaStreamSynchronize(stream);
+        (void) cudaStreamDestroy(stream);
+    }
+    delete[] host_down_locked;
+    delete[] host_up_locked;
+    if (milliseconds)
+        *milliseconds =
+            std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    return result;
+#undef PREFOS_CUDA_STATS_CHECK
 }
 
 extern "C" PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_create(

@@ -29,6 +29,14 @@ extern "C"
     PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_warmup_wait(void);
     void prefos_cuda_linear_propagation_release_cache(void);
 
+    PreFOSCudaPropagationStatus prefos_cuda_linear_column_stats(
+        size_t rows, size_t columns, size_t nnz, const int *row_pointers,
+        const int *column_indices, const double *values,
+        const double *constraint_lower, const double *constraint_upper,
+        const unsigned char *remove_rows, int *column_degrees,
+        unsigned char *down_locked, unsigned char *up_locked,
+        double *milliseconds);
+
     PreFOSCudaPropagationStatus prefos_cuda_linear_propagation_create(
         size_t rows, size_t columns, size_t nnz, const int *row_pointers,
         const int *column_indices, const double *values,

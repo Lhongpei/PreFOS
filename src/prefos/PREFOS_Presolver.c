@@ -13,6 +13,7 @@
 #include "explorers/PREFOS_AffineConeAggregation.h"
 #include "explorers/PREFOS_AffineFaceSubstitution.h"
 #include "explorers/PREFOS_ConePropagation.h"
+#include "explorers/PREFOS_ColumnReductions.h"
 #include "explorers/PREFOS_CudaLinearPropagation.h"
 #include "explorers/PREFOS_FreeColumnSubstitution.h"
 #include "explorers/PREFOS_LinearPropagation.h"
@@ -67,12 +68,18 @@ static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     presolver->is_substituted =
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
+    presolver->is_parallel_removed =
+        (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     presolver->substitution_term_count =
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     presolver->substitution_incoming_depth =
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
+    presolver->substitution_keeps_source_row =
+        (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     presolver->substitution_term_start =
         (size_t *) calloc(problem->n, sizeof(size_t));
+    presolver->substitution_source_row =
+        (int *) prefos_internal_alloc_array(problem->n, sizeof(int));
     presolver->substitution_constant = (double *) calloc(problem->n, sizeof(double));
     presolver->variable_to_box =
         (int *) prefos_internal_alloc_array(problem->n, sizeof(int));
@@ -125,9 +132,13 @@ static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
     if (problem->n > 0 &&
         (!presolver->original_to_reduced || !presolver->fixed_values ||
          !presolver->is_fixed || !presolver->is_substituted ||
+         !presolver->is_parallel_removed ||
          !presolver->substitution_term_count ||
          !presolver->substitution_incoming_depth ||
-         !presolver->substitution_term_start || !presolver->substitution_constant ||
+         !presolver->substitution_keeps_source_row ||
+         !presolver->substitution_term_start ||
+         !presolver->substitution_source_row ||
+         !presolver->substitution_constant ||
          !presolver->variable_to_box || !presolver->propagation_lower ||
          !presolver->propagation_upper || !presolver->affine_protected_columns ||
          !presolver->affine_aggregation_source_rows ||
@@ -161,6 +172,7 @@ static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
     for (i = 0; i < problem->n; ++i)
     {
         presolver->variable_to_box[i] = -1;
+        presolver->substitution_source_row[i] = -1;
         presolver->propagation_lower[i] = -INFINITY;
         presolver->propagation_upper[i] = INFINITY;
         presolver->cone_face_box_lower[i] = -INFINITY;
@@ -339,7 +351,9 @@ static PreFOSStatus find_fixed_box_variables(PreFOSPresolver *presolver, size_t 
     if (!presolver->settings.fix_close_box_bounds) return PREFOS_STATUS_OK;
     for (i = 0; i < problem->n_box; ++i)
     {
-        if (!presolver->is_substituted[problem->box_indices[i]] &&
+        if (!presolver->is_fixed[problem->box_indices[i]] &&
+            !presolver->is_substituted[problem->box_indices[i]] &&
+            !presolver->is_parallel_removed[problem->box_indices[i]] &&
             is_close_bound(presolver->working_box_lower[i],
                            presolver->working_box_upper[i],
                            presolver->settings.fixed_variable_tolerance))
@@ -360,7 +374,8 @@ static void build_variable_map(PreFOSPresolver *presolver)
     int next = 0;
     for (i = 0; i < presolver->original.n; ++i)
     {
-        if (presolver->is_fixed[i] || presolver->is_substituted[i])
+        if (presolver->is_fixed[i] || presolver->is_substituted[i] ||
+            presolver->is_parallel_removed[i])
             presolver->original_to_reduced[i] = -1;
         else
             presolver->original_to_reduced[i] = next++;
@@ -663,7 +678,6 @@ accumulate_substituted_linear_objective(const PreFOSPresolver *presolver, int co
                                         double *target_c, double *target_offset)
 {
     size_t term;
-    int mapped;
 
     if (column < 0 || (size_t) column >= presolver->original.n ||
         depth > PREFOS_MAX_SUBSTITUTION_DEPTH)
@@ -698,10 +712,28 @@ accumulate_substituted_linear_objective(const PreFOSPresolver *presolver, int co
         }
         return PREFOS_STATUS_OK;
     }
-    mapped = presolver->original_to_reduced[column];
-    if (mapped < 0 ||
-        !prefos_internal_safe_add_product(&target_c[mapped], 1.0, coefficient))
+    if (!prefos_internal_safe_add_product(&target_c[column], 1.0, coefficient))
         return PREFOS_STATUS_NUMERICAL_ERROR;
+    return PREFOS_STATUS_OK;
+}
+
+PreFOSStatus prefos_internal_expand_linear_objective(
+    const PreFOSPresolver *presolver, double *objective, double *offset)
+{
+    size_t column;
+    if (!presolver || !offset ||
+        (presolver->original.n > 0 && !objective))
+        return PREFOS_STATUS_INVALID_ARGUMENT;
+    if (presolver->original.n > 0)
+        memset(objective, 0, presolver->original.n * sizeof(double));
+    *offset = presolver->original.objective_offset;
+    for (column = 0; column < presolver->original.n; ++column)
+    {
+        PreFOSStatus status = accumulate_substituted_linear_objective(
+            presolver, (int) column, presolver->original.c[column], 0,
+            objective, offset);
+        if (status != PREFOS_STATUS_OK) return status;
+    }
     return PREFOS_STATUS_OK;
 }
 
@@ -710,13 +742,17 @@ static PreFOSStatus build_reduced_objective(PreFOSPresolver *presolver)
     const PreFOSProblemData *source = &presolver->original;
     PreFOSPresolvedProblem *target = &presolver->reduced;
     double *quadratic_product;
+    double *expanded_objective;
     size_t i;
 
     quadratic_product = (double *) calloc(source->n, sizeof(double));
+    expanded_objective = (double *) calloc(source->n, sizeof(double));
     target->c = (double *) calloc(target->n, sizeof(double));
-    if ((source->n > 0 && !quadratic_product) || (target->n > 0 && !target->c))
+    if ((source->n > 0 && (!quadratic_product || !expanded_objective)) ||
+        (target->n > 0 && !target->c))
     {
         free(quadratic_product);
+        free(expanded_objective);
         return PREFOS_STATUS_OUT_OF_MEMORY;
     }
     {
@@ -724,68 +760,81 @@ static PreFOSStatus build_reduced_objective(PreFOSPresolver *presolver)
         if (status != PREFOS_STATUS_OK)
         {
             free(quadratic_product);
+            free(expanded_objective);
             return status;
         }
     }
-    target->objective_offset = source->objective_offset;
+    {
+        PreFOSStatus status = prefos_internal_expand_linear_objective(
+            presolver, expanded_objective, &target->objective_offset);
+        if (status != PREFOS_STATUS_OK)
+        {
+            free(quadratic_product);
+            free(expanded_objective);
+            return status;
+        }
+    }
     for (i = 0; i < source->n; ++i)
     {
         int mapped = presolver->original_to_reduced[i];
         if (mapped >= 0)
         {
             if (!prefos_internal_safe_add_product(&target->c[mapped], 1.0,
-                                               source->c[i]) ||
+                                               expanded_objective[i]) ||
                 !prefos_internal_safe_add_product(&target->c[mapped], 1.0,
                                                quadratic_product[i]))
             {
                 free(quadratic_product);
+                free(expanded_objective);
                 return PREFOS_STATUS_NUMERICAL_ERROR;
             }
         }
         else if (presolver->is_fixed[i])
         {
             if (!prefos_internal_safe_add_product(&target->objective_offset,
-                                               source->c[i],
-                                               presolver->fixed_values[i]) ||
-                !prefos_internal_safe_add_product(&target->objective_offset,
                                                0.5 * presolver->fixed_values[i],
                                                quadratic_product[i]))
             {
                 free(quadratic_product);
+                free(expanded_objective);
                 return PREFOS_STATUS_NUMERICAL_ERROR;
             }
         }
         else if (presolver->is_substituted[i])
         {
-            PreFOSStatus status;
+            if (quadratic_product[i] != 0.0 || expanded_objective[i] != 0.0)
+            {
+                free(quadratic_product);
+                free(expanded_objective);
+                return PREFOS_STATUS_NUMERICAL_ERROR;
+            }
+        }
+        else if (presolver->is_parallel_removed[i])
+        {
             if (quadratic_product[i] != 0.0)
             {
                 free(quadratic_product);
+                free(expanded_objective);
                 return PREFOS_STATUS_NUMERICAL_ERROR;
-            }
-            status = accumulate_substituted_linear_objective(
-                presolver, (int) i, source->c[i], 0, target->c,
-                &target->objective_offset);
-            if (status != PREFOS_STATUS_OK)
-            {
-                free(quadratic_product);
-                return status;
             }
         }
         else
         {
             free(quadratic_product);
+            free(expanded_objective);
             return PREFOS_STATUS_NUMERICAL_ERROR;
         }
     }
     free(quadratic_product);
+    free(expanded_objective);
     return PREFOS_STATUS_OK;
 }
 
 PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
 {
     PreFOSStatus status;
-    size_t n_fixed_box, n_fixed_total = 0, n_substituted_total = 0, i;
+    size_t n_fixed_box, n_fixed_total = 0, n_substituted_total = 0;
+    size_t n_parallel_removed = 0, i;
     const PreFOSProblemData *source;
     PreFOSPresolvedProblem *target;
 
@@ -796,9 +845,12 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     free(presolver->fixed_values);
     free(presolver->is_fixed);
     free(presolver->is_substituted);
+    free(presolver->is_parallel_removed);
     free(presolver->substitution_term_count);
     free(presolver->substitution_incoming_depth);
+    free(presolver->substitution_keeps_source_row);
     free(presolver->substitution_term_start);
+    free(presolver->substitution_source_row);
     free(presolver->substitution_constant);
     free(presolver->substitution_targets);
     free(presolver->substitution_scales);
@@ -836,14 +888,18 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     presolver->fixed_values = NULL;
     presolver->is_fixed = NULL;
     presolver->is_substituted = NULL;
+    presolver->is_parallel_removed = NULL;
     presolver->substitution_term_count = NULL;
     presolver->substitution_incoming_depth = NULL;
+    presolver->substitution_keeps_source_row = NULL;
     presolver->substitution_term_start = NULL;
+    presolver->substitution_source_row = NULL;
     presolver->substitution_constant = NULL;
     presolver->substitution_targets = NULL;
     presolver->substitution_scales = NULL;
     presolver->n_substitution_terms = 0;
     presolver->substitution_term_capacity = 0;
+    presolver->n_parallel_column_reductions = 0;
     presolver->variable_to_box = NULL;
     presolver->working_box_lower = NULL;
     presolver->working_box_upper = NULL;
@@ -894,6 +950,8 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
         presolver->normalized_nonnegative_cones;
 
     status = initialize_working_state(presolver);
+    if (status != PREFOS_STATUS_OK) goto failure;
+    status = prefos_internal_reduce_linear_columns(presolver);
     if (status != PREFOS_STATUS_OK) goto failure;
     status = prefos_internal_aggregate_affine_cone_coordinates(presolver);
     if (status != PREFOS_STATUS_OK) goto failure;
@@ -948,15 +1006,24 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
             prefos_internal_timer_elapsed_milliseconds(&start, &stop);
     }
     if (status != PREFOS_STATUS_OK) goto failure;
+    status = prefos_internal_remove_redundant_box_bounds(presolver);
+    if (status != PREFOS_STATUS_OK) goto failure;
+    status = prefos_internal_reduce_parallel_columns(presolver);
+    if (status != PREFOS_STATUS_OK) goto failure;
     status = find_fixed_box_variables(presolver, &n_fixed_box);
     if (status != PREFOS_STATUS_OK) goto failure;
     for (i = 0; i < source->n; ++i)
     {
         if (presolver->is_fixed[i]) ++n_fixed_total;
         if (presolver->is_substituted[i]) ++n_substituted_total;
+        if (presolver->is_parallel_removed[i]) ++n_parallel_removed;
     }
-    presolver->stats.fixed_box_variables = n_fixed_box;
-    target->n = source->n - n_fixed_total - n_substituted_total;
+    presolver->stats.fixed_box_variables = 0;
+    for (i = 0; i < source->n_box; ++i)
+        if (presolver->is_fixed[source->box_indices[i]])
+            ++presolver->stats.fixed_box_variables;
+    target->n =
+        source->n - n_fixed_total - n_substituted_total - n_parallel_removed;
     target->q_storage = source->q_storage;
     build_variable_map(presolver);
 
@@ -1016,6 +1083,16 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
         presolver->stats.reduced_exponential_faces > 0 ||
         presolver->stats.reduced_power_faces > 0 ||
         presolver->stats.removed_redundant_rows > 0 ||
+        presolver->stats.removed_redundant_row_lower_sides > 0 ||
+        presolver->stats.removed_redundant_row_upper_sides > 0 ||
+        presolver->stats.removed_redundant_box_lower_bounds > 0 ||
+        presolver->stats.removed_redundant_box_upper_bounds > 0 ||
+        presolver->stats.removed_empty_columns > 0 ||
+        presolver->stats.removed_singleton_columns > 0 ||
+        presolver->stats.tightened_singleton_rows > 0 ||
+        presolver->stats.substituted_bounded_doubletons > 0 ||
+        presolver->stats.dual_fixed_columns > 0 ||
+        presolver->stats.merged_parallel_columns > 0 ||
         presolver->stats.removed_singleton_rows > 0 ||
         presolver->stats.removed_empty_rows > 0 || target->A.nnz != source->A.nnz ||
         target->Q.nnz != source->Q.nnz || target->R.nnz != source->R.nnz)

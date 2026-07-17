@@ -101,6 +101,47 @@ limit disables that adaptive guard, and `prefos_strict_settings()` disables both
 Statistics expose event/full rounds, work, fallback count, and budget/stale
 stop counts.
 
+## Linear Column Reductions
+
+PreFOS applies LP-style column rules to independent box variables that are
+absent from `Q`, `R`, direct coupled cones, and affine cone rows. Normalized
+nonnegative variables are eligible because their domain is exactly a scalar
+box. Coupled or nonlinear columns are skipped rather than approximated.
+
+The structural pass provides the following rules:
+
+- Empty columns are fixed at their objective-improving finite endpoint, or at
+  zero when the objective is flat. An improving infinite endpoint returns
+  `PREFOS_STATUS_PRIMAL_UNBOUNDED`.
+- Dual fixing uses directional row locks to fix a linear column at a finite box
+  endpoint, and detects the corresponding unlocked infinite direction.
+- Singleton columns are eliminated when the source row implies both box sides.
+  Equality singletons with one remaining box side are replaced by the exact
+  residual inequality. An objective-driven inequality singleton may tighten a
+  ranged row to its active side.
+- Optional bounded-doubleton substitution transfers the eliminated variable's
+  interval to the retained variable, subject to the aggregation degree and
+  fill budgets. It is disabled by default.
+- Objective-compatible parallel columns are merged through their Minkowski-sum
+  interval. Objective-incompatible pairs can still fix one column when an
+  infinite compensation direction proves the endpoint optimal; an infinite
+  endpoint proves unboundedness.
+
+All substitutions are expanded through one current linear-objective view, so
+free-column aggregation followed by singleton or parallel-column reduction
+cannot lose transferred objective terms. Primal postsolve replays singleton,
+doubleton, and parallel-column transformations in reverse. Primal-dual
+postsolve also decomposes normals introduced by bounded doubletons and maps a
+one-sided singleton's residual-row dual back to the eliminated box normal and
+original equality multiplier.
+
+Activity analysis can remove only the redundant lower or upper side of a row.
+Under `PREFOS_PROPAGATED_BOUND_POLICY_INTERIOR_POINT`, the final cleanup can
+also remove a one-sided box bound proved by a retained row. These proofs use
+only bounds still exposed in the working model, are applied sequentially to
+avoid circular certificates, and iterate to a fixed point. First-order mode
+keeps such box bounds because projection handles them cheaply.
+
 ## Bound Exposure Policies
 
 `PreFOSSettings.propagated_bound_policy` controls how accepted linear-propagation
@@ -208,6 +249,13 @@ candidates outward, and suspected infeasibility is rechecked by the CPU. CUDA's
 primary context and asynchronous allocation pool persist at process scope; GPU
 setup, transfer, kernel, total, long-row, round, and fallback statistics are
 exposed for backend comparisons.
+
+When `structural_reductions_gpu = 1`, a block-per-row CUDA pass also computes
+active column degrees and directional row locks for empty-column detection and
+dual fixing. CPU-only builds and runtime failures use the same CPU rules and
+increment `structural_gpu_fallbacks`; successful device passes increment
+`structural_gpu_passes`. The option is disabled by default because small host
+models do not amortize device setup.
 
 ## Direct Cone Reductions
 

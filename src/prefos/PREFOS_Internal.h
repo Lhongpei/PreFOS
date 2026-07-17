@@ -47,6 +47,13 @@ typedef struct
     unsigned char is_lower;
 } PreFOSAffineBoundCertificate;
 
+typedef enum
+{
+    PREFOS_SUBSTITUTION_STANDARD = 0,
+    PREFOS_SUBSTITUTION_BOUNDED_DOUBLETON,
+    PREFOS_SUBSTITUTION_RESIDUAL_ROW
+} PreFOSSubstitutionMode;
+
 struct PreFOSPresolver
 {
     PreFOSProblemData original;
@@ -58,9 +65,12 @@ struct PreFOSPresolver
     double *fixed_values;
     unsigned char *is_fixed;
     unsigned char *is_substituted;
+    unsigned char *is_parallel_removed;
     unsigned char *substitution_term_count;
     unsigned char *substitution_incoming_depth;
+    unsigned char *substitution_keeps_source_row;
     size_t *substitution_term_start;
+    int *substitution_source_row;
     double *substitution_constant;
     int *substitution_targets;
     double *substitution_scales;
@@ -102,6 +112,7 @@ struct PreFOSPresolver
     PresolveTransformationLog transformations;
     size_t normalized_nonnegative_variables;
     size_t normalized_nonnegative_cones;
+    size_t n_parallel_column_reductions;
     int has_run;
 };
 
@@ -125,6 +136,8 @@ PREFOS_INTERNAL PreFOSStatus prefos_internal_append_bound_record(PreFOSPresolver
                                                         double new_bound,
                                                         int is_lower);
 PREFOS_INTERNAL int prefos_internal_values_close(double left, double right,
-                                           double tolerance);
+                                               double tolerance);
+PREFOS_INTERNAL PreFOSStatus prefos_internal_expand_linear_objective(
+    const PreFOSPresolver *presolver, double *objective, double *offset);
 
 #endif

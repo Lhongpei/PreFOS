@@ -991,6 +991,18 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
             if (cone_support_strengthened)
                 ++presolver->stats.cone_activity_rows_removed;
         }
+        else if (lower_implied &&
+                 isfinite(presolver->working_constraint_lower[row]))
+        {
+            presolver->working_constraint_lower[row] = -INFINITY;
+            ++presolver->stats.removed_redundant_row_lower_sides;
+        }
+        else if (upper_implied &&
+                 isfinite(presolver->working_constraint_upper[row]))
+        {
+            presolver->working_constraint_upper[row] = INFINITY;
+            ++presolver->stats.removed_redundant_row_upper_sides;
+        }
     }
     prefos_internal_cone_activity_workspace_free(&workspace);
     free(retained_lower);

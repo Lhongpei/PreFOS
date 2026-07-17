@@ -723,6 +723,7 @@ def run_seed(
     settings.affine_cone_coordinate_aggregation = int(affine_cone_aggregation)
     if use_gpu:
         settings.linear_propagation_gpu = 1
+        settings.structural_reductions_gpu = 1
         settings.event_queue_max_average_column_degree = 0.0
     presolver = ct.c_void_p()
     status = library.prefos_create_presolver(

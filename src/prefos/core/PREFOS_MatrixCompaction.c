@@ -42,7 +42,8 @@ static PreFOSStatus compact_a_without_substitutions(PreFOSPresolver *presolver)
                     return PREFOS_STATUS_NUMERICAL_ERROR;
                 }
             }
-            else if (source->A.values[p] != 0.0)
+            else if (!presolver->is_parallel_removed[column] &&
+                     source->A.values[p] != 0.0)
                 ++remaining;
         }
         lower = presolver->working_constraint_lower[row] - shifts[row];
@@ -138,6 +139,7 @@ static PreFOSStatus accumulate_transformed_column(const PreFOSPresolver *presolv
                                              presolver->fixed_values[column])
                    ? PREFOS_STATUS_OK
                    : PREFOS_STATUS_NUMERICAL_ERROR;
+    if (presolver->is_parallel_removed[column]) return PREFOS_STATUS_OK;
     if (presolver->is_substituted[column])
     {
         size_t start = presolver->substitution_term_start[column];
@@ -192,6 +194,10 @@ static PreFOSStatus accumulate_transformed_a_row(const PreFOSPresolver *presolve
         double coefficient = A->values[p];
         PreFOSStatus status;
         if (coefficient == 0.0) continue;
+        if (presolver->is_substituted[column] &&
+            presolver->substitution_keeps_source_row[column] &&
+            presolver->substitution_source_row[column] == (int) row)
+            continue;
         status = accumulate_transformed_column(presolver, column, coefficient, 0,
                                                row_values, row_marks,
                                                touched_columns, n_touched, shift);

@@ -144,8 +144,8 @@ static int column_can_be_eliminated(const PreFOSPresolver *presolver, int column
            !presolver->affine_protected_columns[column] &&
            presolver->substitution_incoming_depth[column] <
                PREFOS_MAX_SUBSTITUTION_DEPTH &&
-           presolver->original.box_lower[box_position] == -INFINITY &&
-           presolver->original.box_upper[box_position] == INFINITY &&
+           presolver->working_box_lower[box_position] == -INFINITY &&
+           presolver->working_box_upper[box_position] == INFINITY &&
            !quadratic_column[column] && !factor_column[column];
 }
 
@@ -198,6 +198,12 @@ static PreFOSStatus accumulate_expanded_column(const PreFOSPresolver *presolver,
     if (column < 0 || (size_t) column >= presolver->original.n ||
         depth > PREFOS_MAX_SUBSTITUTION_DEPTH)
         return PREFOS_STATUS_NUMERICAL_ERROR;
+    if (presolver->is_fixed[column])
+        return prefos_internal_safe_add_product(
+                   shift, coefficient, presolver->fixed_values[column])
+                   ? PREFOS_STATUS_OK
+                   : PREFOS_STATUS_NUMERICAL_ERROR;
+    if (presolver->is_parallel_removed[column]) return PREFOS_STATUS_OK;
     if (presolver->is_substituted[column])
     {
         size_t start = presolver->substitution_term_start[column];
@@ -420,6 +426,7 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
     unsigned char *factor_column = NULL;
     unsigned char *protected_target = NULL;
     double *working_objective = NULL;
+    double working_objective_offset = 0.0;
     size_t row, round;
     PreFOSStatus status = PREFOS_STATUS_OK;
 
@@ -440,7 +447,11 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
         goto cleanup;
     }
     if (problem->n > 0)
-        memcpy(working_objective, problem->c, problem->n * sizeof(double));
+    {
+        status = prefos_internal_expand_linear_objective(
+            presolver, working_objective, &working_objective_offset);
+        if (status != PREFOS_STATUS_OK) goto cleanup;
+    }
 
     for (row = 0; row < problem->Q.rows; ++row)
     {
@@ -460,6 +471,20 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
              ++p)
             if (problem->R.values[p] != 0.0)
                 factor_column[problem->R.column_indices[p]] = 1;
+    }
+
+    if (presolver->stats.substituted_free_variables > 0 ||
+        presolver->stats.removed_empty_columns > 0 ||
+        presolver->stats.dual_fixed_columns > 0 ||
+        presolver->stats.merged_parallel_columns > 0)
+    {
+        status = materialize_aggregation_matrix(
+            presolver, current_matrix, current_lower, current_upper,
+            &owned_current);
+        if (status != PREFOS_STATUS_OK) goto cleanup;
+        current_matrix = &owned_current.matrix;
+        current_lower = owned_current.lower;
+        current_upper = owned_current.upper;
     }
 
     for (round = 0;

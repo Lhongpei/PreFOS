@@ -17,6 +17,71 @@ static int vector_is_finite(const double *values, size_t count)
     return 1;
 }
 
+static double choose_interval_value(double lower, double upper)
+{
+    if (lower <= 0.0 && upper >= 0.0) return 0.0;
+    if (isfinite(lower) && isfinite(upper))
+        return prefos_internal_safe_midpoint(lower, upper);
+    if (isfinite(lower)) return lower;
+    if (isfinite(upper)) return upper;
+    return 0.0;
+}
+
+static PreFOSStatus replay_parallel_column_primal(
+    const PresolveColumnTransformationRecord *record, size_t columns,
+    double tolerance,
+    double *original_x)
+{
+    double aggregate, source_lower, source_upper, source_value, target_value;
+    double feasible_lower, feasible_upper;
+    if (record->column < 0 || record->secondary_column < 0 ||
+        (size_t) record->column >= columns ||
+        (size_t) record->secondary_column >= columns ||
+        record->ratio == 0.0 || !isfinite(record->ratio))
+        return PREFOS_STATUS_NUMERICAL_ERROR;
+    aggregate = original_x[record->secondary_column];
+    source_lower = record->lower;
+    source_upper = record->upper;
+    feasible_lower = source_lower;
+    feasible_upper = source_upper;
+    if (record->ratio > 0.0)
+    {
+        if (isfinite(record->secondary_upper))
+            feasible_lower =
+                fmax(feasible_lower,
+                     (aggregate - record->secondary_upper) / record->ratio);
+        if (isfinite(record->secondary_lower))
+            feasible_upper =
+                fmin(feasible_upper,
+                     (aggregate - record->secondary_lower) / record->ratio);
+    }
+    else
+    {
+        if (isfinite(record->secondary_lower))
+            feasible_lower =
+                fmax(feasible_lower,
+                     (aggregate - record->secondary_lower) / record->ratio);
+        if (isfinite(record->secondary_upper))
+            feasible_upper =
+                fmin(feasible_upper,
+                     (aggregate - record->secondary_upper) / record->ratio);
+    }
+    if (feasible_lower > feasible_upper + tolerance)
+        return PREFOS_STATUS_NUMERICAL_ERROR;
+    if (feasible_lower > feasible_upper)
+        feasible_lower = feasible_upper =
+            prefos_internal_safe_midpoint(feasible_lower, feasible_upper);
+    source_value = choose_interval_value(feasible_lower, feasible_upper);
+    if (isfinite(feasible_lower)) source_value = fmax(source_value, feasible_lower);
+    if (isfinite(feasible_upper)) source_value = fmin(source_value, feasible_upper);
+    target_value = aggregate - record->ratio * source_value;
+    if (!isfinite(source_value) || !isfinite(target_value))
+        return PREFOS_STATUS_NUMERICAL_ERROR;
+    original_x[record->column] = source_value;
+    original_x[record->secondary_column] = target_value;
+    return PREFOS_STATUS_OK;
+}
+
 PreFOSStatus prefos_postsolve_primal(const PreFOSPresolver *presolver,
                                const double *reduced_x, double *original_x)
 {
@@ -47,6 +112,14 @@ PreFOSStatus prefos_postsolve_primal(const PreFOSPresolver *presolver,
         if (record->type == PRESOLVE_COLUMN_FIXED && record->source_row == -1 &&
             record->column_tag < 0)
             continue;
+        if (record->type == PRESOLVE_COLUMNS_PARALLEL)
+        {
+            PreFOSStatus status = replay_parallel_column_primal(
+                record, presolver->original.n,
+                presolver->settings.feasibility_tolerance, original_x);
+            if (status != PREFOS_STATUS_OK) return status;
+            continue;
+        }
         if (record->type != PRESOLVE_COLUMN_SUBSTITUTED || record->column < 0 ||
             (size_t) record->column >= presolver->original.n)
             return PREFOS_STATUS_NUMERICAL_ERROR;
@@ -705,6 +778,8 @@ replay_row_transformation(const PresolveRowTransformationRecord *record,
         original_y[record->row] = record->dual_value;
         return PREFOS_STATUS_OK;
     }
+    if (record->type == PRESOLVE_ROW_EQUALITY_RELAXED)
+        return PREFOS_STATUS_OK;
     if (record->type != PRESOLVE_ROW_LOWER_CHANGED &&
         record->type != PRESOLVE_ROW_UPPER_CHANGED)
         return PREFOS_STATUS_NUMERICAL_ERROR;
@@ -723,6 +798,121 @@ replay_row_transformation(const PresolveRowTransformationRecord *record,
                                        record->ratio, row_dual))
         return PREFOS_STATUS_NUMERICAL_ERROR;
     original_y[record->row] = 0.0;
+    return PREFOS_STATUS_OK;
+}
+
+static void interval_normal_range(double value, double lower, double upper,
+                                  double tolerance, double *normal_lower,
+                                  double *normal_upper)
+{
+    int lower_active =
+        isfinite(lower) && prefos_internal_values_close(value, lower, tolerance);
+    int upper_active =
+        isfinite(upper) && prefos_internal_values_close(value, upper, tolerance);
+
+    if (lower_active && upper_active)
+    {
+        *normal_lower = -INFINITY;
+        *normal_upper = INFINITY;
+    }
+    else if (lower_active)
+    {
+        *normal_lower = -INFINITY;
+        *normal_upper = 0.0;
+    }
+    else if (upper_active)
+    {
+        *normal_lower = 0.0;
+        *normal_upper = INFINITY;
+    }
+    else
+    {
+        *normal_lower = 0.0;
+        *normal_upper = 0.0;
+    }
+}
+
+static PreFOSStatus split_bounded_substitution_normal(
+    const PresolveColumnTransformationRecord *record, double tolerance,
+    const double *original_x, double *original_z)
+{
+    double source_normal_lower, source_normal_upper;
+    double target_normal_lower, target_normal_upper;
+    double induced_lower, induced_upper, feasible_lower, feasible_upper;
+    double aggregate_normal, source_normal, target_normal;
+    double alpha = record->ratio;
+
+    if (record->secondary_column < 0 || alpha == 0.0 || !isfinite(alpha))
+        return PREFOS_STATUS_NUMERICAL_ERROR;
+    aggregate_normal = original_z[record->secondary_column];
+    interval_normal_range(original_x[record->column], record->lower,
+                          record->upper, tolerance, &source_normal_lower,
+                          &source_normal_upper);
+    interval_normal_range(original_x[record->secondary_column],
+                          record->secondary_lower, record->secondary_upper,
+                          tolerance, &target_normal_lower,
+                          &target_normal_upper);
+
+    /* The reduced interval normal satisfies z_bar = z_target + alpha*z_source. */
+    if (alpha > 0.0)
+    {
+        induced_lower = (aggregate_normal - target_normal_upper) / alpha;
+        induced_upper = (aggregate_normal - target_normal_lower) / alpha;
+    }
+    else
+    {
+        induced_lower = (aggregate_normal - target_normal_lower) / alpha;
+        induced_upper = (aggregate_normal - target_normal_upper) / alpha;
+    }
+    feasible_lower = fmax(source_normal_lower, induced_lower);
+    feasible_upper = fmin(source_normal_upper, induced_upper);
+    if (feasible_lower > feasible_upper)
+    {
+        double scale = fmax(1.0, fmax(fabs(feasible_lower),
+                                      fabs(feasible_upper)));
+        if (!isfinite(scale) || feasible_lower - feasible_upper > tolerance * scale)
+            return PREFOS_STATUS_DUAL_RECOVERY_UNAVAILABLE;
+        source_normal = prefos_internal_safe_midpoint(feasible_lower,
+                                                       feasible_upper);
+    }
+    else if (feasible_lower <= 0.0 && feasible_upper >= 0.0)
+        source_normal = 0.0;
+    else
+        source_normal = feasible_lower > 0.0 ? feasible_lower : feasible_upper;
+
+    if (!isfinite(source_normal) ||
+        !prefos_internal_safe_add_product(&aggregate_normal, -alpha,
+                                          source_normal))
+        return PREFOS_STATUS_NUMERICAL_ERROR;
+    target_normal = aggregate_normal;
+    original_z[record->column] = source_normal;
+    original_z[record->secondary_column] = target_normal;
+    return PREFOS_STATUS_OK;
+}
+
+static PreFOSStatus substitution_source_stationarity(
+    const PreFOSPresolver *presolver,
+    const PresolveColumnTransformationRecord *record, const double *original_y,
+    long double *stationarity, double *source_coefficient)
+{
+    size_t position;
+
+    *stationarity = (long double) record->objective_coefficient;
+    *source_coefficient = 0.0;
+    for (position = 0; position < record->length; ++position)
+    {
+        int row = record->indices[position];
+        double coefficient = record->coefficients[position];
+        if (row < 0 || (size_t) row >= presolver->original.A.rows)
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        if (row == record->source_row)
+            *source_coefficient = coefficient;
+        else
+            *stationarity +=
+                (long double) coefficient * (long double) original_y[row];
+    }
+    if (*source_coefficient == 0.0 || !isfinite(*stationarity))
+        return PREFOS_STATUS_NUMERICAL_ERROR;
     return PREFOS_STATUS_OK;
 }
 
@@ -785,13 +975,27 @@ replay_affine_face_column(const PreFOSPresolver *presolver,
 static PreFOSStatus
 replay_column_transformation(const PreFOSPresolver *presolver,
                              const PresolveColumnTransformationRecord *record,
+                             double tolerance, const double *original_x,
                              double *pre_face_affine_z, double *original_y,
                              double *original_z)
 {
     long double stationarity;
     double source_coefficient = 0.0;
-    size_t position;
+    PreFOSStatus status;
 
+    if (record->type == PRESOLVE_COLUMNS_PARALLEL)
+    {
+        if (record->column < 0 || record->secondary_column < 0 ||
+            (size_t) record->column >= presolver->original.n ||
+            (size_t) record->secondary_column >= presolver->original.n ||
+            !isfinite(record->ratio))
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        original_z[record->column] =
+            record->ratio * original_z[record->secondary_column];
+        return isfinite(original_z[record->column])
+                   ? PREFOS_STATUS_OK
+                   : PREFOS_STATUS_NUMERICAL_ERROR;
+    }
     if (record->source_row == -1 && record->column_tag < 0)
         return replay_affine_face_column(presolver, record, pre_face_affine_z,
                                          original_y, original_z);
@@ -801,26 +1005,39 @@ replay_column_transformation(const PreFOSPresolver *presolver,
         return PREFOS_STATUS_NUMERICAL_ERROR;
     if (presolver->affine_aggregation_source_rows[record->column] >= 0)
         return PREFOS_STATUS_OK;
-    stationarity = (long double) record->objective_coefficient;
-    for (position = 0; position < record->length; ++position)
+    status = substitution_source_stationarity(
+        presolver, record, original_y, &stationarity, &source_coefficient);
+    if (status != PREFOS_STATUS_OK) return status;
+    if (record->direction == PREFOS_SUBSTITUTION_BOUNDED_DOUBLETON)
     {
-        int row = record->indices[position];
-        double coefficient = record->coefficients[position];
-        if (row < 0 || (size_t) row >= presolver->original.A.rows)
+        if (record->secondary_column < 0 ||
+            (size_t) record->secondary_column >= presolver->original.n)
             return PREFOS_STATUS_NUMERICAL_ERROR;
-        if (row == record->source_row)
-            source_coefficient = coefficient;
-        else
-            stationarity +=
-                (long double) coefficient * (long double) original_y[row];
+        status = split_bounded_substitution_normal(
+            record, tolerance, original_x, original_z);
+        if (status != PREFOS_STATUS_OK) return status;
     }
-    if (source_coefficient == 0.0 || !isfinite(stationarity) ||
-        fabsl(stationarity / (long double) source_coefficient) >
-            (long double) DBL_MAX)
+    else if (record->direction == PREFOS_SUBSTITUTION_RESIDUAL_ROW)
+    {
+        double residual_dual = original_y[record->source_row];
+        double source_normal;
+        /* The retained residual inequality is exactly the eliminated box side. */
+        if (!prefos_internal_safe_product(-source_coefficient, residual_dual,
+                                          &source_normal))
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        original_z[record->column] = source_normal;
+    }
+    else if (record->direction != PREFOS_SUBSTITUTION_STANDARD)
+        return PREFOS_STATUS_NUMERICAL_ERROR;
+    else
+        original_z[record->column] = 0.0;
+
+    stationarity += (long double) original_z[record->column];
+    if (fabsl(stationarity / (long double) source_coefficient) >
+        (long double) DBL_MAX)
         return PREFOS_STATUS_NUMERICAL_ERROR;
     original_y[record->source_row] =
         (double) (-stationarity / (long double) source_coefficient);
-    original_z[record->column] = 0.0;
     return PREFOS_STATUS_OK;
 }
 
@@ -1140,7 +1357,8 @@ static PreFOSStatus postsolve_primal_dual_internal(
                 presolver,
                 &presolver->transformations
                      .column_transformations[event->record_index],
-                pre_face_affine_z, original_y, original_z);
+                tolerance, original_x, pre_face_affine_z, original_y,
+                original_z);
             --i;
         }
         else
@@ -1844,7 +2062,9 @@ const char *prefos_status_string(PreFOSStatus status)
         case PREFOS_STATUS_OUT_OF_MEMORY:
             return "out of memory";
         case PREFOS_STATUS_DUAL_RECOVERY_UNAVAILABLE:
-            return "standard dual recovery unavailable after facial reduction";
+            return "standard dual recovery unavailable after this reduction";
+        case PREFOS_STATUS_PRIMAL_UNBOUNDED:
+            return "primal unbounded";
         default:
             return "unknown status";
     }

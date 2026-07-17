@@ -105,6 +105,13 @@ class Settings(ct.Structure):
         ("affine_cone_coordinate_aggregation", ct.c_int),
         ("psd_structure_analysis", ct.c_int),
         ("psd_block_decomposition", ct.c_int),
+        ("remove_empty_columns", ct.c_int),
+        ("singleton_column_reduction", ct.c_int),
+        ("bounded_doubleton_substitution", ct.c_int),
+        ("dual_fixing", ct.c_int),
+        ("parallel_column_reduction", ct.c_int),
+        ("remove_redundant_bounds", ct.c_int),
+        ("structural_reductions_gpu", ct.c_int),
     ]
 
 
@@ -236,22 +243,38 @@ def solve_box_qp(A, lower, upper, Q, R, D, c, box_indices, box_lower,
     operator = sp.vstack((A, selector), format="csc")
     all_lower = np.concatenate((lower, box_lower))
     all_upper = np.concatenate((upper, box_upper))
-    solver = osqp.OSQP()
-    solver.setup(
-        P=sp.triu(hessian, format="csc"),
-        q=c,
-        A=operator,
-        l=all_lower,
-        u=all_upper,
-        eps_abs=1e-9,
-        eps_rel=1e-9,
-        max_iter=100000,
-        polishing=False,
-        verbose=False,
+    result = None
+    attempts = (
+        {"max_iter": 200000, "polishing": False},
+        {
+            "max_iter": 1000000,
+            "polishing": True,
+            "scaled_termination": True,
+            "adaptive_rho_interval": 10,
+        },
     )
-    result = solver.solve()
+    for options in attempts:
+        solver = osqp.OSQP()
+        solver.setup(
+            P=sp.triu(hessian, format="csc"),
+            q=c,
+            A=operator,
+            l=all_lower,
+            u=all_upper,
+            eps_abs=1e-9,
+            eps_rel=1e-9,
+            verbose=False,
+            **options,
+        )
+        result = solver.solve()
+        if result.info.status_val in (1, 2):
+            break
     if result.info.status_val not in (1, 2):
-        raise AssertionError(f"OSQP failed: {result.info.status}")
+        raise AssertionError(
+            f"OSQP failed: {result.info.status}; "
+            f"primal={result.info.prim_res:.3e}, "
+            f"dual={result.info.dual_res:.3e}"
+        )
     row_dual = result.y[: A.shape[0]]
     box_dual = result.y[A.shape[0] :]
     return result.x, result.info.obj_val + offset, row_dual, box_dual
@@ -369,6 +392,7 @@ def run_seed(library, seed, use_gpu=False, propagated_bound_policy=0):
     settings.propagated_bound_policy = propagated_bound_policy
     if use_gpu:
         settings.linear_propagation_gpu = 1
+        settings.structural_reductions_gpu = 1
         settings.event_queue_max_average_column_degree = 0.0
     presolver = ct.c_void_p()
     status = library.prefos_create_presolver(
@@ -397,19 +421,22 @@ def run_seed(library, seed, use_gpu=False, propagated_bound_policy=0):
         )
         reduced_box_lower = numpy_vector(reduced.box_lower, reduced.n_box)
         reduced_box_upper = numpy_vector(reduced.box_upper, reduced.n_box)
-        reduced_x, reduced_objective, reduced_y, reduced_box_dual = solve_box_qp(
-            reduced_A,
-            reduced_lower,
-            reduced_upper,
-            reduced_Q,
-            reduced_R,
-            reduced_D,
-            reduced_c,
-            reduced_box_indices,
-            reduced_box_lower,
-            reduced_box_upper,
-            reduced.objective_offset,
-        )
+        try:
+            reduced_x, reduced_objective, reduced_y, reduced_box_dual = solve_box_qp(
+                reduced_A,
+                reduced_lower,
+                reduced_upper,
+                reduced_Q,
+                reduced_R,
+                reduced_D,
+                reduced_c,
+                reduced_box_indices,
+                reduced_box_lower,
+                reduced_box_upper,
+                reduced.objective_offset,
+            )
+        except AssertionError as error:
+            raise AssertionError(f"reduced solve failed for seed {seed}: {error}")
 
         verification = Verification()
         reduced_x = np.ascontiguousarray(reduced_x, dtype=np.float64)
