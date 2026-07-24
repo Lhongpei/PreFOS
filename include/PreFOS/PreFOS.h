@@ -417,6 +417,23 @@ extern "C"
         size_t matrix_compaction_gpu_passes;
         size_t matrix_compaction_gpu_fallbacks;
         double matrix_compaction_gpu_milliseconds;
+        double initialization_milliseconds;
+        double affine_aggregation_milliseconds;
+        double fast_fixed_point_milliseconds;
+        double free_column_substitution_milliseconds;
+        double trivial_row_reduction_milliseconds;
+        double medium_fixed_point_milliseconds;
+        double parallel_column_reduction_milliseconds;
+        double matrix_compaction_milliseconds;
+        double quadratic_compaction_milliseconds;
+        double factor_compaction_milliseconds;
+        double domain_compaction_milliseconds;
+        double objective_compaction_milliseconds;
+        double presolve_total_milliseconds;
+        size_t fast_fixed_point_passes;
+        size_t fast_fixed_point_rounds;
+        size_t medium_fixed_point_rounds;
+        size_t residual_row_substitutions;
     } PreFOSStats;
 
     typedef struct

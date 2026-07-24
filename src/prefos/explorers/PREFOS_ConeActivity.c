@@ -8,11 +8,20 @@
 #include "cones/PREFOS_ExponentialCone.h"
 #include "cones/PREFOS_PowerCone.h"
 
-static int add_bound(long double *sum, long double value, int lower, int outward)
+static int add_bound(double *sum, long double value, int lower, int outward)
 {
     long double old_sum, result;
+    double converted;
     if (!isfinite(value)) return 0;
-    old_sum = *sum;
+    if (!outward)
+    {
+        converted = (double) value;
+        if (!isfinite(converted) || !isfinite(*sum + converted))
+            return 0;
+        *sum += converted;
+        return 1;
+    }
+    old_sum = (long double) *sum;
     result = old_sum + value;
     if (!isfinite(result)) return 0;
     if (outward)
@@ -22,13 +31,27 @@ static int add_bound(long double *sum, long double value, int lower, int outward
         if ((lower && error < 0.0L) || (!lower && error > 0.0L))
             result = nextafterl(result, lower ? -INFINITY : INFINITY);
     }
-    *sum = result;
+    converted = (double) result;
+    if (!isfinite(converted)) return 0;
+    if (outward && lower && (long double) converted > result)
+        converted = nextafter(converted, -INFINITY);
+    if (outward && !lower && (long double) converted < result)
+        converted = nextafter(converted, INFINITY);
+    *sum = converted;
     return 1;
 }
 
-static int add_scalar_term(long double *sum, double coefficient, double bound,
+static int add_scalar_term(double *sum, double coefficient, double bound,
                            int lower, int outward)
 {
+    if (!outward)
+    {
+        double product = coefficient * bound;
+        if (!isfinite(product) || !isfinite(*sum + product))
+            return 0;
+        *sum += product;
+        return 1;
+    }
     long double left = (long double) coefficient;
     long double right = (long double) bound;
     long double product = left * right;
@@ -221,24 +244,86 @@ void prefos_internal_cone_activity_workspace_free(PreFOSConeActivityWorkspace *w
     memset(workspace, 0, sizeof(*workspace));
 }
 
-static int add_cone_group(PreFOSPresolver *presolver, size_t row, int cone_index,
-                          const PreFOSConeBlock *cone, int outward,
+static int standard_dual_summary_contains(
+    const PreFOSConeBlock *cone, int sign, int sign_compatible,
+    long double first, long double second, long double norm,
+    long double norm_squared)
+{
+    first *= (long double) sign;
+    second *= (long double) sign;
+    if (cone->type == PREFOS_CONE_NONNEGATIVE) return sign_compatible;
+    if (cone->type == PREFOS_CONE_SECOND_ORDER)
+    {
+        long double margin;
+        if (first < 0.0L) return 0;
+        if (norm == 0.0L) return 1;
+        margin =
+            64.0L * LDBL_EPSILON * fmaxl(1.0L, fmaxl(first, norm));
+        return first >= norm + margin;
+    }
+    if (first < 0.0L || second < 0.0L) return 0;
+    if (norm_squared == 0.0L) return 1;
+    {
+        long double product = 2.0L * first * second;
+        long double margin;
+        if (!isfinite(product)) return 0;
+        margin = 128.0L * LDBL_EPSILON *
+                 fmaxl(1.0L, fmaxl(product, norm_squared));
+        return product >= norm_squared + margin;
+    }
+}
+
+static int add_cone_group(PreFOSPresolver *presolver, int cone_index,
+                          size_t row, int outward,
+                          int count_statistics,
                           PreFOSConeActivityWorkspace *workspace,
                           PresolveLinearActivity *activity)
 {
     const PreFOSCsrMatrix *A = &presolver->original.A;
-    long double scalar_min = 0.0L, scalar_max = 0.0L;
+    const PreFOSConeBlock *cone =
+        &presolver->original.cones[cone_index];
+    double scalar_min = 0.0, scalar_max = 0.0;
     size_t infinite_min = 0, infinite_max = 0;
-    int p;
+    long double first = 0.0L, second = 0.0L;
+    long double norm = 0.0L, norm_squared = 0.0L;
+    int position;
+    int nonnegative_lower = 1, nonnegative_upper = 1;
     int lower_supported, upper_supported;
-    ++presolver->stats.cone_activity_blocks;
-    for (p = A->row_pointers[row]; p < A->row_pointers[row + 1]; ++p)
+    if (count_statistics)
+        ++presolver->stats.cone_activity_blocks;
+    for (position = A->row_pointers[row];
+         position < A->row_pointers[row + 1]; ++position)
     {
-        int column = A->column_indices[p];
+        int column = A->column_indices[position];
         double coefficient = workspace->coefficients[column];
         double min_bound, max_bound;
-        if (workspace->column_to_cone[column] != cone_index || coefficient == 0.0)
+        if (coefficient == 0.0 ||
+            workspace->column_to_cone[column] != cone_index)
             continue;
+        if (cone->type == PREFOS_CONE_NONNEGATIVE)
+        {
+            if (coefficient < 0.0) nonnegative_lower = 0;
+            if (coefficient > 0.0) nonnegative_upper = 0;
+        }
+        else if (cone->type == PREFOS_CONE_SECOND_ORDER)
+        {
+            if (column == cone->indices[0])
+                first = (long double) coefficient;
+            else
+                norm = hypotl(norm, (long double) coefficient);
+        }
+        else if (cone->type == PREFOS_CONE_ROTATED_SECOND_ORDER)
+        {
+            if (column == cone->indices[0])
+                first = (long double) coefficient;
+            else if (column == cone->indices[1])
+                second = (long double) coefficient;
+            else
+            {
+                long double value = (long double) coefficient;
+                norm_squared += value * value;
+            }
+        }
         min_bound = coefficient > 0.0 ? workspace->lower_bounds[column]
                                       : workspace->upper_bounds[column];
         max_bound = coefficient > 0.0 ? workspace->upper_bounds[column]
@@ -259,24 +344,52 @@ static int add_cone_group(PreFOSPresolver *presolver, size_t row, int cone_index
             ++infinite_max;
     }
 
-    lower_supported =
-        cone->dimension <= 4096 && dual_contains(cone, workspace->coefficients);
-    for (p = A->row_pointers[row]; p < A->row_pointers[row + 1]; ++p)
+    if (cone->type == PREFOS_CONE_NONNEGATIVE ||
+        cone->type == PREFOS_CONE_SECOND_ORDER ||
+        cone->type == PREFOS_CONE_ROTATED_SECOND_ORDER)
     {
-        int column = A->column_indices[p];
-        if (workspace->column_to_cone[column] == cone_index)
-            workspace->coefficients[column] = -workspace->coefficients[column];
+        lower_supported = standard_dual_summary_contains(
+            cone, 1, nonnegative_lower, first, second, norm,
+            norm_squared);
+        upper_supported = standard_dual_summary_contains(
+            cone, -1, nonnegative_upper, first, second, norm,
+            norm_squared);
     }
-    upper_supported =
-        cone->dimension <= 4096 && dual_contains(cone, workspace->coefficients);
-    for (p = A->row_pointers[row]; p < A->row_pointers[row + 1]; ++p)
+    else
     {
-        int column = A->column_indices[p];
-        if (workspace->column_to_cone[column] == cone_index)
-            workspace->coefficients[column] = -workspace->coefficients[column];
+        lower_supported =
+            cone->dimension <= 4096 &&
+            dual_contains(cone, workspace->coefficients);
+        if (cone->dimension <= 4096)
+        {
+            for (position = A->row_pointers[row];
+                 position < A->row_pointers[row + 1]; ++position)
+            {
+                int column = A->column_indices[position];
+                if (workspace->column_to_cone[column] == cone_index)
+                    workspace->coefficients[column] =
+                        -workspace->coefficients[column];
+            }
+        }
+        upper_supported =
+            cone->dimension <= 4096 &&
+            dual_contains(cone, workspace->coefficients);
+        if (cone->dimension <= 4096)
+        {
+            for (position = A->row_pointers[row];
+                 position < A->row_pointers[row + 1]; ++position)
+            {
+                int column = A->column_indices[position];
+                if (workspace->column_to_cone[column] == cone_index)
+                    workspace->coefficients[column] =
+                        -workspace->coefficients[column];
+            }
+        }
     }
-    if (lower_supported) ++presolver->stats.cone_activity_lower_support_hits;
-    if (upper_supported) ++presolver->stats.cone_activity_upper_support_hits;
+    if (count_statistics && lower_supported)
+        ++presolver->stats.cone_activity_lower_support_hits;
+    if (count_statistics && upper_supported)
+        ++presolver->stats.cone_activity_upper_support_hits;
 
     if (lower_supported)
     {
@@ -306,12 +419,14 @@ static int add_cone_group(PreFOSPresolver *presolver, size_t row, int cone_index
 
 PreFOSStatus prefos_internal_compute_cone_aware_row_activity(
     PreFOSPresolver *presolver, size_t row, int outward,
-    PreFOSConeActivityWorkspace *workspace, PresolveLinearActivity *activity)
+    int count_statistics, PreFOSConeActivityWorkspace *workspace,
+    PresolveLinearActivity *activity)
 {
     const PreFOSCsrMatrix *A = &presolver->original.A;
     size_t n_touched = 0, position;
     int p;
-    ++presolver->stats.cone_activity_rows;
+    if (count_statistics)
+        ++presolver->stats.cone_activity_rows;
     workspace->row_support_strengthened = 0;
     memset(activity, 0, sizeof(*activity));
     for (p = A->row_pointers[row]; p < A->row_pointers[row + 1]; ++p)
@@ -320,7 +435,10 @@ PreFOSStatus prefos_internal_compute_cone_aware_row_activity(
         double coefficient = A->values[p];
         int cone_index;
         double min_bound, max_bound;
-        if (coefficient == 0.0) continue;
+        if (coefficient == 0.0 ||
+            !prefos_internal_term_is_active_in_row(
+                presolver, row, column))
+            continue;
         ++activity->n_nonzeros;
         cone_index = workspace->column_to_cone[column];
         if (cone_index >= 0)
@@ -354,18 +472,19 @@ PreFOSStatus prefos_internal_compute_cone_aware_row_activity(
         else
             ++activity->n_infinite_max;
     }
+    if (n_touched == 0) return PREFOS_STATUS_OK;
     for (position = 0; position < n_touched; ++position)
     {
         int cone_index = workspace->touched_cones[position];
-        const PreFOSConeBlock *cone = &presolver->original.cones[cone_index];
-        if (!add_cone_group(presolver, row, cone_index, cone, outward, workspace,
-                            activity))
+        if (!add_cone_group(
+                presolver, cone_index, row, outward,
+                count_statistics, workspace, activity))
             return PREFOS_STATUS_NUMERICAL_ERROR;
         workspace->cone_touched[cone_index] = 0;
     }
     for (p = A->row_pointers[row]; p < A->row_pointers[row + 1]; ++p)
         workspace->coefficients[A->column_indices[p]] = 0.0;
-    if (workspace->row_support_strengthened)
+    if (count_statistics && workspace->row_support_strengthened)
         ++presolver->stats.cone_activity_strengthened_rows;
     return PREFOS_STATUS_OK;
 }

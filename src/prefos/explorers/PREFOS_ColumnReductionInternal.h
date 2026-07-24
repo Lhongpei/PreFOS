@@ -8,15 +8,19 @@
 
 #include "PREFOS_Internal.h"
 
-typedef struct
+typedef struct PreFOSColumnWorkspace
 {
     int *starts;
+    int *ends;
     int *rows;
     double *values;
     unsigned char *quadratic;
     unsigned char *factor;
     unsigned char *protected_target;
     unsigned char *dirty_row;
+    int *row_degrees;
+    int *live_degrees;
+    double *column_max_abs_coefficient;
     int *gpu_degrees;
     unsigned char *gpu_down_locked;
     unsigned char *gpu_up_locked;
@@ -26,7 +30,9 @@ typedef struct
     int gpu_csc_valid;
     int gpu_singleton_candidates_valid;
     size_t nnz;
+    size_t max_row_nnz;
     size_t n_gpu_singleton_candidates;
+    size_t removed_row_cursor;
 } PreFOSColumnWorkspace;
 
 PREFOS_INTERNAL void
@@ -35,15 +41,27 @@ prefos_internal_free_column_workspace(PreFOSColumnWorkspace *workspace);
 PREFOS_INTERNAL PreFOSStatus prefos_internal_build_column_workspace(
     PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
 
+PREFOS_INTERNAL PreFOSStatus prefos_internal_build_column_workspace_cpu(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
+
+PREFOS_INTERNAL void prefos_internal_refresh_column_workspace(
+    const PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
+
+PREFOS_INTERNAL void prefos_internal_update_column_live_degrees(
+    const PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
+
+PREFOS_INTERNAL PreFOSStatus prefos_internal_prepare_column_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
+
+PREFOS_INTERNAL PreFOSStatus prefos_internal_synchronize_column_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
+
 PREFOS_INTERNAL PreFOSStatus prefos_internal_populate_gpu_column_stats(
     PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
 
 PREFOS_INTERNAL int prefos_internal_column_is_linear_box(
     const PreFOSPresolver *presolver, const PreFOSColumnWorkspace *workspace,
     int column);
-
-PREFOS_INTERNAL void prefos_internal_mark_fixed_column(
-    PreFOSPresolver *presolver, int column, double value);
 
 PREFOS_INTERNAL PreFOSStatus prefos_internal_effective_row_bounds(
     const PreFOSPresolver *presolver, size_t row, double *lower, double *upper);
@@ -72,5 +90,10 @@ PREFOS_INTERNAL PreFOSStatus prefos_internal_reduce_bounded_doubletons(
 PREFOS_INTERNAL PreFOSStatus
 prefos_internal_reduce_parallel_column_groups(
     PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
+
+PREFOS_INTERNAL PreFOSStatus
+prefos_internal_reduce_linear_columns_in_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace,
+    int allow_one_sided_singletons);
 
 #endif

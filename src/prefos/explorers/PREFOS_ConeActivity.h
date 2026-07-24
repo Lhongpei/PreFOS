@@ -26,6 +26,7 @@ PREFOS_INTERNAL void
 prefos_internal_cone_activity_workspace_free(PreFOSConeActivityWorkspace *workspace);
 PREFOS_INTERNAL PreFOSStatus prefos_internal_compute_cone_aware_row_activity(
     PreFOSPresolver *presolver, size_t row, int outward,
-    PreFOSConeActivityWorkspace *workspace, PresolveLinearActivity *activity);
+    int count_statistics, PreFOSConeActivityWorkspace *workspace,
+    PresolveLinearActivity *activity);
 
 #endif

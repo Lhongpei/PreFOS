@@ -7,7 +7,27 @@
 #include "PREFOS_ColumnReductionInternal.h"
 #include "core/PREFOS_Timer.h"
 
-PreFOSStatus prefos_internal_reduce_linear_columns(PreFOSPresolver *presolver)
+PreFOSStatus prefos_internal_reduce_linear_columns_in_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace,
+    int allow_one_sided_singletons)
+{
+    PreFOSStatus status =
+        prefos_internal_reduce_empty_and_dual_fixed_columns(
+            presolver, workspace);
+    if (status == PREFOS_STATUS_OK)
+        status = prefos_internal_reduce_singleton_columns(
+            presolver, workspace, allow_one_sided_singletons);
+    if (status == PREFOS_STATUS_OK)
+        prefos_internal_update_column_live_degrees(
+            presolver, workspace);
+    if (status == PREFOS_STATUS_OK)
+        status = prefos_internal_reduce_bounded_doubletons(
+            presolver, workspace);
+    return status;
+}
+
+PreFOSStatus prefos_internal_reduce_linear_columns(
+    PreFOSPresolver *presolver, int allow_one_sided_singletons)
 {
     PreFOSColumnWorkspace workspace;
     PreFOSTimestamp start, stop;
@@ -18,18 +38,31 @@ PreFOSStatus prefos_internal_reduce_linear_columns(PreFOSPresolver *presolver)
     if (status != PREFOS_STATUS_OK) return status;
     status = prefos_internal_populate_gpu_column_stats(presolver, &workspace);
     if (status == PREFOS_STATUS_OK)
-        status = prefos_internal_reduce_empty_and_dual_fixed_columns(
-            presolver, &workspace);
-    if (status == PREFOS_STATUS_OK)
-        status = prefos_internal_reduce_singleton_columns(
-            presolver, &workspace, 0);
-    if (status == PREFOS_STATUS_OK)
-        status = prefos_internal_reduce_bounded_doubletons(
-            presolver, &workspace);
+        status = prefos_internal_reduce_linear_columns_in_workspace(
+            presolver, &workspace, allow_one_sided_singletons);
     prefos_internal_free_column_workspace(&workspace);
     prefos_internal_timer_now(&stop);
     presolver->stats.structural_reduction_milliseconds +=
         prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+    return status;
+}
+
+PreFOSStatus prefos_internal_reduce_parallel_columns_in_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+{
+    PreFOSStatus status;
+    if (presolver->original.n_box == 0 ||
+        presolver->original.n < 2 ||
+        !presolver->settings.parallel_column_reduction)
+        return PREFOS_STATUS_OK;
+    status = prefos_internal_synchronize_column_workspace(
+        presolver, workspace);
+    if (status == PREFOS_STATUS_OK)
+        status = prefos_internal_reduce_parallel_column_groups(
+            presolver, workspace);
+    if (status == PREFOS_STATUS_OK)
+        status = prefos_internal_reduce_singleton_columns(
+            presolver, workspace, 1);
     return status;
 }
 
@@ -38,15 +71,18 @@ PreFOSStatus prefos_internal_reduce_parallel_columns(PreFOSPresolver *presolver)
     PreFOSColumnWorkspace workspace;
     PreFOSTimestamp start, stop;
     PreFOSStatus status;
-    if (presolver->original.n_box == 0) return PREFOS_STATUS_OK;
+    if (presolver->original.n_box == 0 ||
+        presolver->original.n < 2 ||
+        !presolver->settings.parallel_column_reduction)
+        return PREFOS_STATUS_OK;
     prefos_internal_timer_now(&start);
     status = prefos_internal_build_column_workspace(presolver, &workspace);
     if (status == PREFOS_STATUS_OK)
-        status = prefos_internal_reduce_singleton_columns(
-            presolver, &workspace, 1);
-    if (status == PREFOS_STATUS_OK)
         status = prefos_internal_reduce_parallel_column_groups(
             presolver, &workspace);
+    if (status == PREFOS_STATUS_OK)
+        status = prefos_internal_reduce_singleton_columns(
+            presolver, &workspace, 1);
     prefos_internal_free_column_workspace(&workspace);
     prefos_internal_timer_now(&stop);
     presolver->stats.structural_reduction_milliseconds +=

@@ -256,7 +256,7 @@ int presolve_collect_parallel_row_groups(
     {
         size_t bin_end = row + 1;
         int seed = parallel_rows[row];
-        size_t candidate, group_size = 0;
+        size_t subgroup_start;
         while (bin_end < active_count &&
                support_hashes[parallel_rows[bin_end]] == support_hashes[seed] &&
                coefficient_hashes[parallel_rows[bin_end]] ==
@@ -265,19 +265,41 @@ int presolve_collect_parallel_row_groups(
 
         if (bin_end - row > 1)
         {
-            for (candidate = row + 1; candidate < bin_end; ++candidate)
+            subgroup_start = row;
+            while (subgroup_start < bin_end)
             {
-                if (rows_are_parallel(matrix, seed, parallel_rows[candidate],
-                                      tolerance))
-                    parallel_rows[output_count + group_size++] =
-                        parallel_rows[candidate];
-            }
-            if (group_size > 0)
-            {
-                parallel_rows[output_count + group_size++] = seed;
-                output_count += group_size;
-                if (group_count + 1 >= group_starts_capacity) return 0;
-                group_starts[++group_count] = (int) output_count;
+                size_t group_end = subgroup_start + 1;
+                size_t candidate;
+                seed = parallel_rows[subgroup_start];
+                for (candidate = group_end; candidate < bin_end; ++candidate)
+                {
+                    if (rows_are_parallel(
+                            matrix, seed, parallel_rows[candidate],
+                            tolerance))
+                    {
+                        int temporary = parallel_rows[group_end];
+                        parallel_rows[group_end] = parallel_rows[candidate];
+                        parallel_rows[candidate] = temporary;
+                        ++group_end;
+                    }
+                }
+                if (group_end - subgroup_start > 1)
+                {
+                    size_t group_size = group_end - subgroup_start;
+                    int subgroup_seed = parallel_rows[subgroup_start];
+                    if (group_count + 1 >= group_starts_capacity)
+                        return 0;
+                    memmove(parallel_rows + subgroup_start,
+                            parallel_rows + subgroup_start + 1,
+                            (group_size - 1) * sizeof(int));
+                    parallel_rows[group_end - 1] = subgroup_seed;
+                    memmove(parallel_rows + output_count,
+                            parallel_rows + subgroup_start,
+                            group_size * sizeof(int));
+                    output_count += group_size;
+                    group_starts[++group_count] = (int) output_count;
+                }
+                subgroup_start = group_end;
             }
         }
         row = bin_end;

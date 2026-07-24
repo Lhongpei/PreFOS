@@ -114,7 +114,7 @@ static void mark_substitution(PreFOSPresolver *presolver, int column,
         (unsigned char) (presolver->substitution_incoming_depth[column] + 1);
 
     presolver->is_substituted[column] = 1;
-    presolver->substitution_term_count[column] = (unsigned char) term_count;
+    presolver->substitution_term_count[column] = term_count;
     presolver->substitution_term_start[column] = start;
     presolver->substitution_constant[column] = constant;
     for (term = 0; term < term_count; ++term)
@@ -128,7 +128,7 @@ static void mark_substitution(PreFOSPresolver *presolver, int column,
     }
     presolver->n_substitution_terms += term_count;
     presolver->variable_to_box[column] = -1;
-    presolver->remove_rows[source_row] = 1;
+    prefos_internal_mark_removed_row(presolver, (size_t) source_row);
     ++presolver->stats.substituted_free_variables;
     if (term_count == 2) ++presolver->stats.ternary_substituted_free_variables;
 }
@@ -207,9 +207,8 @@ static PreFOSStatus accumulate_expanded_column(const PreFOSPresolver *presolver,
     if (presolver->is_substituted[column])
     {
         size_t start = presolver->substitution_term_start[column];
-        unsigned char count = presolver->substitution_term_count[column];
-        if (count == 0 || count > PREFOS_MAX_AGGREGATION_TERMS ||
-            start > presolver->n_substitution_terms ||
+        size_t count = presolver->substitution_term_count[column];
+        if (count == 0 || start > presolver->n_substitution_terms ||
             count > presolver->n_substitution_terms - start ||
             !prefos_internal_safe_add_product(shift, coefficient,
                                            presolver->substitution_constant[column]))
@@ -472,11 +471,26 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
             if (problem->R.values[p] != 0.0)
                 factor_column[problem->R.column_indices[p]] = 1;
     }
+    {
+        int has_candidate = 0;
+        for (row = 0; row < problem->n; ++row)
+        {
+            if (column_can_be_eliminated(
+                    presolver, (int) row, quadratic_column, factor_column,
+                    protected_target))
+            {
+                has_candidate = 1;
+                break;
+            }
+        }
+        if (!has_candidate) goto cleanup;
+    }
 
-    if (presolver->stats.substituted_free_variables > 0 ||
-        presolver->stats.removed_empty_columns > 0 ||
-        presolver->stats.dual_fixed_columns > 0 ||
-        presolver->stats.merged_parallel_columns > 0)
+    if (presolver->n_fixed_columns > 0 ||
+        presolver->n_residual_row_substitutions > 0 ||
+        presolver->stats.substituted_bounded_doubletons > 0 ||
+        presolver->n_parallel_column_reductions > 0 ||
+        presolver->n_affine_face_substitutions > 0)
     {
         status = materialize_aggregation_matrix(
             presolver, current_matrix, current_lower, current_upper,

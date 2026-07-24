@@ -11,12 +11,16 @@ void prefos_internal_free_column_workspace(PreFOSColumnWorkspace *workspace)
 {
     if (!workspace) return;
     free(workspace->starts);
+    free(workspace->ends);
     free(workspace->rows);
     free(workspace->values);
     free(workspace->quadratic);
     free(workspace->factor);
     free(workspace->protected_target);
     free(workspace->dirty_row);
+    free(workspace->row_degrees);
+    free(workspace->live_degrees);
+    free(workspace->column_max_abs_coefficient);
     free(workspace->gpu_degrees);
     free(workspace->gpu_down_locked);
     free(workspace->gpu_up_locked);
@@ -44,11 +48,23 @@ static PreFOSStatus build_column_csc_cpu(
         {
             int column = problem->A.column_indices[p];
             if (problem->A.values[p] != 0.0)
+            {
                 ++workspace->starts[column + 1];
+                ++workspace->row_degrees[row];
+                workspace->column_max_abs_coefficient[column] =
+                    fmax(workspace->column_max_abs_coefficient[column],
+                         fabs(problem->A.values[p]));
+            }
         }
+        if ((size_t) workspace->row_degrees[row] >
+            workspace->max_row_nnz)
+            workspace->max_row_nnz =
+                (size_t) workspace->row_degrees[row];
     }
     for (position = 0; position < problem->n; ++position)
         workspace->starts[position + 1] += workspace->starts[position];
+    for (position = 0; position < problem->n; ++position)
+        workspace->ends[position] = workspace->starts[position + 1];
     workspace->nnz = (size_t) workspace->starts[problem->n];
     workspace->rows =
         (int *) prefos_internal_alloc_array(workspace->nnz, sizeof(int));
@@ -136,14 +152,17 @@ static PreFOSStatus build_column_csc_gpu(
         return PREFOS_STATUS_OK;
     }
     workspace->nnz = active_nnz;
+    for (size_t column = 0; column < problem->n; ++column)
+        workspace->ends[column] = workspace->starts[column + 1];
     workspace->gpu_csc_valid = 1;
     ++presolver->stats.column_csc_gpu_builds;
     *used_gpu = 1;
     return PREFOS_STATUS_OK;
 }
 
-PreFOSStatus prefos_internal_build_column_workspace(
-    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+static PreFOSStatus build_column_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace,
+    int allow_gpu)
 {
     const PreFOSProblemData *problem = &presolver->original;
     size_t row;
@@ -152,6 +171,7 @@ PreFOSStatus prefos_internal_build_column_workspace(
 
     memset(workspace, 0, sizeof(*workspace));
     workspace->starts = (int *) calloc(problem->n + 1, sizeof(int));
+    workspace->ends = (int *) calloc(problem->n, sizeof(int));
     workspace->quadratic =
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     workspace->factor =
@@ -160,17 +180,30 @@ PreFOSStatus prefos_internal_build_column_workspace(
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     workspace->dirty_row =
         (unsigned char *) calloc(problem->A.rows, sizeof(unsigned char));
+    workspace->row_degrees =
+        (int *) calloc(problem->A.rows, sizeof(int));
+    workspace->live_degrees =
+        (int *) calloc(problem->n, sizeof(int));
+    workspace->column_max_abs_coefficient =
+        (double *) calloc(problem->n, sizeof(double));
     workspace->objective = (double *) calloc(problem->n, sizeof(double));
     if (!workspace->starts ||
         (problem->n > 0 &&
-         (!workspace->quadratic || !workspace->factor ||
-          !workspace->protected_target || !workspace->objective)) ||
-        (problem->A.rows > 0 && !workspace->dirty_row))
+         (!workspace->ends || !workspace->quadratic || !workspace->factor ||
+          !workspace->protected_target ||
+          !workspace->live_degrees ||
+          !workspace->column_max_abs_coefficient ||
+          !workspace->objective)) ||
+        (problem->A.rows > 0 &&
+         (!workspace->dirty_row || !workspace->row_degrees)))
     {
         prefos_internal_free_column_workspace(workspace);
         return PREFOS_STATUS_OUT_OF_MEMORY;
     }
-    status = build_column_csc_gpu(presolver, workspace, &used_gpu);
+    status = allow_gpu
+                 ? build_column_csc_gpu(
+                       presolver, workspace, &used_gpu)
+                 : PREFOS_STATUS_OK;
     if (status != PREFOS_STATUS_OK)
     {
         prefos_internal_free_column_workspace(workspace);
@@ -183,6 +216,32 @@ PreFOSStatus prefos_internal_build_column_workspace(
         {
             prefos_internal_free_column_workspace(workspace);
             return status;
+        }
+    }
+    for (row = 0; row < problem->n; ++row)
+        workspace->live_degrees[row] =
+            workspace->ends[row] - workspace->starts[row];
+    workspace->removed_row_cursor = presolver->n_removed_rows;
+    for (row = 0; row < problem->n; ++row)
+        workspace->protected_target[row] = (unsigned char)
+            presolver->affine_face_substitution_targets[row];
+    for (row = 0; row < problem->A.rows; ++row)
+    {
+        int p;
+        if (presolver->remove_rows[row]) continue;
+        for (p = problem->A.row_pointers[row];
+             p < problem->A.row_pointers[row + 1]; ++p)
+        {
+            int column = problem->A.column_indices[p];
+            if (presolver->is_substituted[column] ||
+                presolver->is_parallel_removed[column])
+            {
+                if (!prefos_internal_term_is_active_in_row(
+                        presolver, row, column))
+                    continue;
+                workspace->dirty_row[row] = 1;
+                break;
+            }
         }
     }
 
@@ -216,6 +275,105 @@ PreFOSStatus prefos_internal_build_column_workspace(
         }
     }
     return PREFOS_STATUS_OK;
+}
+
+PreFOSStatus prefos_internal_build_column_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+{
+    return build_column_workspace(presolver, workspace, 1);
+}
+
+PreFOSStatus prefos_internal_build_column_workspace_cpu(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+{
+    return build_column_workspace(presolver, workspace, 0);
+}
+
+void prefos_internal_refresh_column_workspace(
+    const PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+{
+    size_t column;
+    prefos_internal_update_column_live_degrees(presolver, workspace);
+    for (column = 0; column < presolver->original.n; ++column)
+    {
+        int read, write = workspace->starts[column];
+        for (read = workspace->starts[column];
+             read < workspace->ends[column]; ++read)
+        {
+            int row = workspace->rows[read];
+            if (presolver->remove_rows[row]) continue;
+            if (write != read)
+            {
+                workspace->rows[write] = row;
+                workspace->values[write] = workspace->values[read];
+            }
+            ++write;
+        }
+        workspace->ends[column] = write;
+        workspace->live_degrees[column] =
+            write - workspace->starts[column];
+    }
+}
+
+void prefos_internal_update_column_live_degrees(
+    const PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+{
+    const PreFOSCsrMatrix *matrix = &presolver->original.A;
+    if (workspace->removed_row_cursor < presolver->n_removed_rows)
+        workspace->gpu_stats_valid = 0;
+    while (workspace->removed_row_cursor < presolver->n_removed_rows)
+    {
+        int row =
+            presolver->removed_row_log[workspace->removed_row_cursor++];
+        int position;
+        for (position = matrix->row_pointers[row];
+             position < matrix->row_pointers[row + 1]; ++position)
+        {
+            int column = matrix->column_indices[position];
+            if (matrix->values[position] != 0.0 &&
+                workspace->live_degrees[column] > 0)
+                --workspace->live_degrees[column];
+        }
+    }
+}
+
+PreFOSStatus prefos_internal_prepare_column_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+{
+    double ignored_offset;
+    size_t column;
+    prefos_internal_update_column_live_degrees(presolver, workspace);
+    for (column = 0; column < presolver->original.n; ++column)
+    {
+        int position;
+        workspace->protected_target[column] =
+            presolver->affine_face_substitution_targets[column];
+        if (!presolver->is_substituted[column] &&
+            !presolver->is_parallel_removed[column])
+            continue;
+        for (position = workspace->starts[column];
+             position < workspace->ends[column]; ++position)
+        {
+            int row = workspace->rows[position];
+            if (presolver->remove_rows[row]) continue;
+            if (prefos_internal_term_is_active_in_row(
+                    presolver, (size_t) row, (int) column))
+                workspace->dirty_row[row] = 1;
+        }
+    }
+    return prefos_internal_expand_linear_objective(
+        presolver, workspace->objective, &ignored_offset);
+}
+
+PreFOSStatus prefos_internal_synchronize_column_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+{
+    prefos_internal_refresh_column_workspace(presolver, workspace);
+    if (presolver->original.A.rows > 0)
+        memset(workspace->dirty_row, 0,
+               presolver->original.A.rows * sizeof(unsigned char));
+    return prefos_internal_prepare_column_workspace(
+        presolver, workspace);
 }
 
 PreFOSStatus prefos_internal_populate_gpu_column_stats(
@@ -275,13 +433,36 @@ int prefos_internal_column_is_linear_box(
            !workspace->quadratic[column] && !workspace->factor[column];
 }
 
-void prefos_internal_mark_fixed_column(PreFOSPresolver *presolver, int column,
-                                       double value)
+int prefos_internal_mark_fixed_column(PreFOSPresolver *presolver, int column,
+                                      double value)
 {
+    int newly_fixed = !presolver->is_fixed[column];
+    if (!presolver->is_fixed[column])
+    {
+        ++presolver->fixed_column_epoch;
+        if (presolver->n_fixed_columns < presolver->original.n)
+            presolver->fixed_column_log[presolver->n_fixed_columns++] =
+                column;
+    }
     presolver->is_fixed[column] = 1;
     presolver->fixed_values[column] = value;
     presolver->propagation_lower[column] = value;
     presolver->propagation_upper[column] = value;
+    return newly_fixed;
+}
+
+int prefos_internal_mark_removed_row(PreFOSPresolver *presolver, size_t row)
+{
+    int newly_removed;
+    if (!presolver || row >= presolver->original.A.rows) return 0;
+    newly_removed = !presolver->remove_rows[row];
+    if (newly_removed)
+    {
+        presolver->remove_rows[row] = 1;
+        if (presolver->n_removed_rows < presolver->original.A.rows)
+            presolver->removed_row_log[presolver->n_removed_rows++] = (int) row;
+    }
+    return newly_removed;
 }
 
 PreFOSStatus prefos_internal_effective_row_bounds(

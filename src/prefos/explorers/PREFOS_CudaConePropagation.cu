@@ -118,7 +118,8 @@ __global__ void cone_envelope_kernel(
     double *upper_candidates, unsigned char *cone_flags)
 {
     size_t cone = static_cast<size_t>(blockIdx.x);
-    if (cone >= cones || threadIdx.x != 0) return;
+    cone = cone * blockDim.x + threadIdx.x;
+    if (cone >= cones) return;
     int type = cone_types[cone];
     if (type < 0) return;
     int start = cone_starts[cone];
@@ -459,7 +460,6 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_cone_envelope_round(
 {
     using Clock = std::chrono::steady_clock;
     auto start = Clock::now();
-    unsigned char *device_flags = nullptr;
     cudaError_t cuda_status = cudaSuccess;
     PreFOSCudaPropagationStatus result = PREFOS_CUDA_PROPAGATION_OK;
 
@@ -486,8 +486,6 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_cone_envelope_round(
     PREFOS_CUDA_CONE_CHECK(copy_to_device(
         context->upper_bounds, upper_bounds, context->columns,
         context->stream));
-    PREFOS_CUDA_CONE_CHECK(
-        allocate_device(&device_flags, context->n_cones, context->stream));
     {
         size_t count =
             context->columns > context->n_cones ? context->columns
@@ -500,20 +498,21 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_cone_envelope_round(
                                                 context->stream>>>(
                 context->columns, context->n_cones,
                 context->lower_candidates, context->upper_candidates,
-                device_flags);
+                context->cone_flags);
             PREFOS_CUDA_CONE_CHECK(cudaGetLastError());
         }
     }
     if (context->n_cones > 0)
     {
-        cone_envelope_kernel<<<static_cast<unsigned int>(context->n_cones),
-                               32, 0, context->stream>>>(
+        unsigned int blocks = static_cast<unsigned int>(
+            (context->n_cones + kThreads - 1) / kThreads);
+        cone_envelope_kernel<<<blocks, kThreads, 0, context->stream>>>(
             context->n_cones, context->cone_types, context->cone_starts,
             context->cone_indices, context->cone_matrix_orders,
             context->cone_power_alphas,
             context->lower_bounds, context->upper_bounds,
             feasibility_tolerance, context->lower_candidates,
-            context->upper_candidates, device_flags);
+            context->upper_candidates, context->cone_flags);
         PREFOS_CUDA_CONE_CHECK(cudaGetLastError());
     }
     PREFOS_CUDA_CONE_CHECK(copy_to_host(
@@ -523,12 +522,12 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_cone_envelope_round(
         upper_candidates, context->upper_candidates, context->columns,
         context->stream));
     PREFOS_CUDA_CONE_CHECK(copy_to_host(
-        cone_flags, device_flags, context->n_cones, context->stream));
+        cone_flags, context->cone_flags, context->n_cones, context->stream));
     PREFOS_CUDA_CONE_CHECK(cudaStreamSynchronize(context->stream));
 
 cleanup:
-    cudaFreeAsync(device_flags, context->stream);
-    (void) cudaStreamSynchronize(context->stream);
+    if (result != PREFOS_CUDA_PROPAGATION_OK)
+        (void) cudaStreamSynchronize(context->stream);
     if (milliseconds)
         *milliseconds =
             std::chrono::duration<double, std::milli>(Clock::now() - start)

@@ -17,15 +17,21 @@ typedef PresolveLinearActivity PreFOSRowActivity;
 
 typedef struct
 {
+    const PreFOSColumnWorkspace *column_workspace;
     PreFOSRowActivity *activities;
+    PreFOSRowActivity *redundancy_activities;
     int *box_column_pointers;
     int *adjacent_rows;
     int *adjacent_positions;
+    unsigned char *redundancy_activity_stale;
+    double *box_max_abs_coefficient;
     PresolveDirtyRows dirty_rows;
     size_t activity_update_budget;
     size_t activity_updates_used;
     size_t total_work_limit;
+    int integrate_redundancy;
     int fallback_requested;
+    int current_row;
 } PreFOSLinearPropagationState;
 
 static size_t saturated_work_add(size_t left, size_t right)
@@ -69,9 +75,12 @@ static void free_linear_propagation_state(PreFOSLinearPropagationState *state)
 {
     if (!state) return;
     free(state->activities);
+    free(state->redundancy_activities);
     free(state->box_column_pointers);
     free(state->adjacent_rows);
     free(state->adjacent_positions);
+    free(state->redundancy_activity_stale);
+    free(state->box_max_abs_coefficient);
     presolve_dirty_rows_free(&state->dirty_rows);
     memset(state, 0, sizeof(*state));
 }
@@ -83,17 +92,73 @@ static PreFOSStatus compute_row_activity_with_bounds(const PreFOSPresolver *pres
                                                   PreFOSRowActivity *activity)
 {
     const PreFOSCsrMatrix *A = &presolver->original.A;
-    PresolveLinearPropagationOps operations = {.lower_bounds = lower_bounds,
-                                               .upper_bounds = upper_bounds,
-                                               .bound_stride = sizeof(double),
-                                               .candidate_map =
-                                                   presolver->variable_to_box};
     int start = A->row_pointers[row];
+    int length = A->row_pointers[row + 1] - start;
+    if (!outward)
+    {
+        int position;
+        memset(activity, 0, sizeof(*activity));
+        for (position = start; position < start + length; ++position)
+        {
+            int column = A->column_indices[position];
+            double coefficient = A->values[position];
+            double minimum_bound, maximum_bound;
+            double product;
+            if (coefficient == 0.0 ||
+                !prefos_internal_term_is_active_in_row(
+                    presolver, row, column))
+                continue;
+            ++activity->n_nonzeros;
+            minimum_bound = coefficient > 0.0
+                                ? lower_bounds[column]
+                                : upper_bounds[column];
+            maximum_bound = coefficient > 0.0
+                                ? upper_bounds[column]
+                                : lower_bounds[column];
+            if (isfinite(minimum_bound))
+            {
+                product = coefficient * minimum_bound;
+                if (!isfinite(product) ||
+                    !isfinite(activity->finite_min + product))
+                    return PREFOS_STATUS_NUMERICAL_ERROR;
+                activity->finite_min += product;
+            }
+            else
+                ++activity->n_infinite_min;
+            if (isfinite(maximum_bound))
+            {
+                product = coefficient * maximum_bound;
+                if (!isfinite(product) ||
+                    !isfinite(activity->finite_max + product))
+                    return PREFOS_STATUS_NUMERICAL_ERROR;
+                activity->finite_max += product;
+            }
+            else
+                ++activity->n_infinite_max;
+        }
+        return PREFOS_STATUS_OK;
+    }
+    {
+        PresolveLinearPropagationOps operations = {
+            .lower_bounds = lower_bounds,
+            .upper_bounds = upper_bounds,
+            .bound_stride = sizeof(double),
+            .candidate_map = presolver->variable_to_box,
+            .row_excluded_columns =
+                presolver->residual_source_column,
+            .row_exclusion_flags =
+                presolver->n_residual_row_substitutions > 0
+                    ? presolver->substitution_keeps_source_row
+                    : NULL,
+            .row_exclusion_sources =
+                presolver->substitution_source_row,
+            .row_index = (int) row};
     return presolve_internal_compute_linear_activity(
                A->values + start, A->column_indices + start,
-               A->row_pointers[row + 1] - start, &operations, outward, activity)
+               length, &operations, outward, activity)
                ? PREFOS_STATUS_OK
                : PREFOS_STATUS_NUMERICAL_ERROR;
+    }
 }
 
 static PreFOSStatus compute_row_activity(const PreFOSPresolver *presolver, size_t row,
@@ -102,6 +167,129 @@ static PreFOSStatus compute_row_activity(const PreFOSPresolver *presolver, size_
     return compute_row_activity_with_bounds(presolver, row, outward,
                                             presolver->propagation_lower,
                                             presolver->propagation_upper, activity);
+}
+
+static int activity_needs_rigorous_confirmation(
+    const PreFOSPresolver *presolver, size_t row,
+    const PreFOSRowActivity *activity)
+{
+    double lower = presolver->working_constraint_lower[row];
+    double upper = presolver->working_constraint_upper[row];
+    PresolveLinearRowState row_state =
+        presolve_internal_classify_linear_row(
+            activity, lower, upper,
+            presolver->settings.feasibility_tolerance, 0.0);
+    return (row_state & PRESOLVE_ROW_INFEASIBLE) != 0 ||
+           (isfinite(lower) &&
+            (row_state & PRESOLVE_ROW_LOWER_REDUNDANT) != 0) ||
+           (isfinite(upper) &&
+            (row_state & PRESOLVE_ROW_UPPER_REDUNDANT) != 0);
+}
+
+static PreFOSStatus refresh_rigorous_activity_if_needed(
+    const PreFOSPresolver *presolver, size_t row,
+    const PreFOSRowActivity *activity, PreFOSRowActivity *outward,
+    int *recomputed)
+{
+    *recomputed = 0;
+    if (!activity_needs_rigorous_confirmation(
+            presolver, row, activity))
+    {
+        *outward = *activity;
+        return PREFOS_STATUS_OK;
+    }
+    *recomputed = 1;
+    return compute_row_activity(presolver, row, 1, outward);
+}
+
+static PreFOSStatus compute_row_activities_with_bounds(
+    const PreFOSPresolver *presolver, size_t row,
+    const double *lower_bounds, const double *upper_bounds,
+    PreFOSRowActivity *activity, PreFOSRowActivity *outward)
+{
+    PreFOSStatus status = compute_row_activity_with_bounds(
+        presolver, row, 0, lower_bounds, upper_bounds, activity);
+    if (status != PREFOS_STATUS_OK) return status;
+    if (activity_needs_rigorous_confirmation(
+            presolver, row, activity))
+        return compute_row_activity_with_bounds(
+            presolver, row, 1, lower_bounds, upper_bounds, outward);
+    *outward = *activity;
+    return PREFOS_STATUS_OK;
+}
+
+static PreFOSStatus compute_row_activities(
+    const PreFOSPresolver *presolver, size_t row,
+    PreFOSRowActivity *activity, PreFOSRowActivity *outward)
+{
+    return compute_row_activities_with_bounds(
+        presolver, row, presolver->propagation_lower,
+        presolver->propagation_upper, activity, outward);
+}
+
+static PreFOSStatus compute_initial_row_activity(
+    const PreFOSPresolver *presolver, PreFOSLinearPropagationState *state,
+    size_t row, int *has_box_column)
+{
+    const PreFOSCsrMatrix *A = &presolver->original.A;
+    PreFOSRowActivity *activity = &state->activities[row];
+    int p;
+
+    memset(activity, 0, sizeof(*activity));
+    *has_box_column = 0;
+    for (p = A->row_pointers[row]; p < A->row_pointers[row + 1]; ++p)
+    {
+        int column = A->column_indices[p];
+        int box_position = presolver->variable_to_box[column];
+        double coefficient = A->values[p];
+        double minimum_bound, maximum_bound;
+        double product;
+
+        if (coefficient == 0.0 ||
+            !prefos_internal_term_is_active_in_row(
+                presolver, row, column))
+            continue;
+        ++activity->n_nonzeros;
+        minimum_bound = coefficient > 0.0
+                            ? presolver->propagation_lower[column]
+                            : presolver->propagation_upper[column];
+        maximum_bound = coefficient > 0.0
+                            ? presolver->propagation_upper[column]
+                            : presolver->propagation_lower[column];
+        if (isfinite(minimum_bound))
+        {
+            product = coefficient * minimum_bound;
+            if (!isfinite(product) ||
+                !isfinite(activity->finite_min + product))
+                return PREFOS_STATUS_NUMERICAL_ERROR;
+            activity->finite_min += product;
+        }
+        else
+            ++activity->n_infinite_min;
+        if (isfinite(maximum_bound))
+        {
+            product = coefficient * maximum_bound;
+            if (!isfinite(product) ||
+                !isfinite(activity->finite_max + product))
+                return PREFOS_STATUS_NUMERICAL_ERROR;
+            activity->finite_max += product;
+        }
+        else
+            ++activity->n_infinite_max;
+
+        if (box_position < 0) continue;
+        if (!state->column_workspace)
+        {
+            state->box_max_abs_coefficient[box_position] =
+                fmax(state->box_max_abs_coefficient[box_position],
+                     fabs(coefficient));
+            if (state->box_column_pointers[box_position + 1] == INT_MAX)
+                return PREFOS_STATUS_OUT_OF_MEMORY;
+            ++state->box_column_pointers[box_position + 1];
+        }
+        *has_box_column = 1;
+    }
+    return PREFOS_STATUS_OK;
 }
 
 long double prefos_internal_propagation_margin(const PreFOSPresolver *presolver,
@@ -155,93 +343,206 @@ static int row_can_propagate(const PreFOSPresolver *presolver, size_t row,
             activity->n_infinite_max <= 1);
 }
 
+static int scalar_redundancy_can_share_activity(
+    const PreFOSPresolver *presolver)
+{
+    const PreFOSProblemData *problem = &presolver->original;
+    int over_cpu_budget;
+    if (!presolver->settings.remove_redundant_rows ||
+        presolver->scalar_redundancy_completed ||
+        presolver->settings.propagated_bound_policy !=
+            PREFOS_PROPAGATED_BOUND_POLICY_FIRST_ORDER)
+        return 0;
+    over_cpu_budget =
+        presolver->settings.redundant_row_max_average_nnz > 0.0 &&
+        (long double) problem->A.nnz >
+            (long double) problem->A.rows *
+                (long double)
+                    presolver->settings.redundant_row_max_average_nnz;
+    return !over_cpu_budget || presolver->settings.structural_reductions_gpu;
+}
+
+static PreFOSStatus apply_scalar_row_classification(
+    PreFOSPresolver *presolver, size_t row,
+    const PreFOSRowActivity *activity, int *removed)
+{
+    PresolveLinearRowState row_state;
+    int lower_implied, upper_implied;
+    PreFOSStatus status;
+
+    *removed = 0;
+    status = check_row_activity(presolver, row, activity);
+    if (status != PREFOS_STATUS_OK || activity->n_nonzeros == 0)
+        return status;
+    row_state = presolve_internal_classify_linear_row(
+        activity, presolver->working_constraint_lower[row],
+        presolver->working_constraint_upper[row],
+        presolver->settings.feasibility_tolerance, 0.0);
+    lower_implied = (row_state & PRESOLVE_ROW_LOWER_REDUNDANT) != 0;
+    upper_implied = (row_state & PRESOLVE_ROW_UPPER_REDUNDANT) != 0;
+    if (lower_implied && upper_implied)
+    {
+        prefos_internal_mark_removed_row(presolver, row);
+        ++presolver->stats.removed_redundant_rows;
+        *removed = 1;
+    }
+    else if (lower_implied &&
+             isfinite(presolver->working_constraint_lower[row]))
+    {
+        presolver->working_constraint_lower[row] = -INFINITY;
+        ++presolver->stats.removed_redundant_row_lower_sides;
+    }
+    else if (upper_implied &&
+             isfinite(presolver->working_constraint_upper[row]))
+    {
+        presolver->working_constraint_upper[row] = INFINITY;
+        ++presolver->stats.removed_redundant_row_upper_sides;
+    }
+    return PREFOS_STATUS_OK;
+}
+
 static PreFOSStatus
 initialize_linear_propagation_state(PreFOSPresolver *presolver,
-                                    PreFOSLinearPropagationState *state)
+                                    PreFOSLinearPropagationState *state,
+                                    const PreFOSColumnWorkspace *column_workspace)
 {
     const PreFOSProblemData *problem = &presolver->original;
     size_t row, box_position, active_nnz = 0;
     int *cursor = NULL;
 
     memset(state, 0, sizeof(*state));
+    state->current_row = -1;
+    state->column_workspace = column_workspace;
+    state->integrate_redundancy =
+        scalar_redundancy_can_share_activity(presolver);
     state->activities =
         (PreFOSRowActivity *) calloc(problem->A.rows, sizeof(PreFOSRowActivity));
-    state->box_column_pointers = (int *) calloc(problem->n_box + 1, sizeof(int));
+    if (state->integrate_redundancy)
+        state->redundancy_activities = (PreFOSRowActivity *)
+            calloc(problem->A.rows, sizeof(PreFOSRowActivity));
+    if (!column_workspace)
+        state->box_column_pointers =
+            (int *) calloc(problem->n_box + 1, sizeof(int));
+    state->redundancy_activity_stale =
+        (unsigned char *) calloc(problem->A.rows, sizeof(unsigned char));
+    if (!column_workspace)
+        state->box_max_abs_coefficient =
+            (double *) calloc(problem->n_box, sizeof(double));
     if (!presolve_dirty_rows_init(&state->dirty_rows, problem->A.rows))
         return PREFOS_STATUS_OUT_OF_MEMORY;
-    if ((problem->A.rows > 0 && !state->activities) || !state->box_column_pointers)
+    if ((problem->A.rows > 0 &&
+         (!state->activities ||
+          (state->integrate_redundancy &&
+           !state->redundancy_activities) ||
+          !state->redundancy_activity_stale)) ||
+        (!column_workspace && !state->box_column_pointers) ||
+        (!column_workspace && problem->n_box > 0 &&
+         !state->box_max_abs_coefficient))
         return PREFOS_STATUS_OUT_OF_MEMORY;
 
     for (row = 0; row < problem->A.rows; ++row)
     {
-        int p, has_box_column = 0;
+        int has_box_column = 0;
         PreFOSStatus status;
+        if (!presolver->remove_rows[row] &&
+            !isfinite(presolver->working_constraint_lower[row]) &&
+            !isfinite(presolver->working_constraint_upper[row]) &&
+            state->integrate_redundancy)
+        {
+            prefos_internal_mark_removed_row(presolver, row);
+            ++presolver->stats.removed_redundant_rows;
+            continue;
+        }
         if (!row_is_active_for_linear_propagation(presolver, row)) continue;
-        status = compute_row_activity(presolver, row, 0, &state->activities[row]);
+        status = compute_initial_row_activity(
+            presolver, state, row, &has_box_column);
         if (status != PREFOS_STATUS_OK) return status;
-        status = check_row_activity(presolver, row, &state->activities[row]);
+        if (state->integrate_redundancy)
+        {
+            int recomputed;
+            status = refresh_rigorous_activity_if_needed(
+                presolver, row, &state->activities[row],
+                &state->redundancy_activities[row], &recomputed);
+        }
+        else
+        {
+            status = check_row_activity(
+                presolver, row, &state->activities[row]);
+            if (status == PREFOS_STATUS_PRIMAL_INFEASIBLE)
+            {
+                PreFOSRowActivity outward;
+                status = compute_row_activity(
+                    presolver, row, 1, &outward);
+                if (status == PREFOS_STATUS_OK)
+                    status = check_row_activity(
+                        presolver, row, &outward);
+            }
+        }
+        if (status == PREFOS_STATUS_OK && state->integrate_redundancy)
+            status = check_row_activity(
+                presolver, row, &state->redundancy_activities[row]);
         if (status != PREFOS_STATUS_OK) return status;
         presolver->stats.linear_activity_nnz_computed +=
             state->activities[row].n_nonzeros;
         active_nnz += state->activities[row].n_nonzeros;
-        for (p = problem->A.row_pointers[row]; p < problem->A.row_pointers[row + 1];
-             ++p)
-        {
-            int column = problem->A.column_indices[p];
-            int position = presolver->variable_to_box[column];
-            if (problem->A.values[p] == 0.0 || position < 0) continue;
-            if (state->box_column_pointers[position + 1] == INT_MAX)
-                return PREFOS_STATUS_OUT_OF_MEMORY;
-            ++state->box_column_pointers[position + 1];
-            has_box_column = 1;
-        }
-        if (has_box_column &&
-            row_can_propagate(presolver, row, &state->activities[row]))
+        if (state->integrate_redundancy ||
+            (has_box_column &&
+             row_can_propagate(presolver, row, &state->activities[row])))
         {
             if (!presolve_dirty_rows_schedule(&state->dirty_rows, (int) row))
                 return PREFOS_STATUS_OUT_OF_MEMORY;
         }
     }
 
-    for (box_position = 0; box_position < problem->n_box; ++box_position)
+    if (!column_workspace)
     {
-        if (state->box_column_pointers[box_position] >
-            INT_MAX - state->box_column_pointers[box_position + 1])
-            return PREFOS_STATUS_OUT_OF_MEMORY;
-        state->box_column_pointers[box_position + 1] +=
-            state->box_column_pointers[box_position];
-    }
-    state->adjacent_rows = (int *) prefos_internal_alloc_array(
-        (size_t) state->box_column_pointers[problem->n_box], sizeof(int));
-    state->adjacent_positions = (int *) prefos_internal_alloc_array(
-        (size_t) state->box_column_pointers[problem->n_box], sizeof(int));
-    cursor = (int *) prefos_internal_alloc_array(problem->n_box, sizeof(int));
-    if ((state->box_column_pointers[problem->n_box] > 0 &&
-         (!state->adjacent_rows || !state->adjacent_positions)) ||
-        (problem->n_box > 0 && !cursor))
-    {
-        free(cursor);
-        return PREFOS_STATUS_OUT_OF_MEMORY;
-    }
-    if (problem->n_box > 0)
-        memcpy(cursor, state->box_column_pointers, problem->n_box * sizeof(int));
-    for (row = 0; row < problem->A.rows; ++row)
-    {
-        int p;
-        if (!row_is_active_for_linear_propagation(presolver, row)) continue;
-        for (p = problem->A.row_pointers[row]; p < problem->A.row_pointers[row + 1];
-             ++p)
+        for (box_position = 0; box_position < problem->n_box; ++box_position)
         {
-            int column = problem->A.column_indices[p];
-            int position = presolver->variable_to_box[column];
-            int write;
-            if (problem->A.values[p] == 0.0 || position < 0) continue;
-            write = cursor[position]++;
-            state->adjacent_rows[write] = (int) row;
-            state->adjacent_positions[write] = p;
+            if (state->box_column_pointers[box_position] >
+                INT_MAX - state->box_column_pointers[box_position + 1])
+                return PREFOS_STATUS_OUT_OF_MEMORY;
+            state->box_column_pointers[box_position + 1] +=
+                state->box_column_pointers[box_position];
         }
+        state->adjacent_rows = (int *) prefos_internal_alloc_array(
+            (size_t) state->box_column_pointers[problem->n_box], sizeof(int));
+        state->adjacent_positions = (int *) prefos_internal_alloc_array(
+            (size_t) state->box_column_pointers[problem->n_box], sizeof(int));
+        cursor = (int *) prefos_internal_alloc_array(
+            problem->n_box, sizeof(int));
+        if ((state->box_column_pointers[problem->n_box] > 0 &&
+             (!state->adjacent_rows || !state->adjacent_positions)) ||
+            (problem->n_box > 0 && !cursor))
+        {
+            free(cursor);
+            return PREFOS_STATUS_OUT_OF_MEMORY;
+        }
+        if (problem->n_box > 0)
+            memcpy(cursor, state->box_column_pointers,
+                   problem->n_box * sizeof(int));
+        for (row = 0; row < problem->A.rows; ++row)
+        {
+            int p;
+            if (!row_is_active_for_linear_propagation(
+                    presolver, row))
+                continue;
+            for (p = problem->A.row_pointers[row];
+                 p < problem->A.row_pointers[row + 1]; ++p)
+            {
+                int column = problem->A.column_indices[p];
+                int position = presolver->variable_to_box[column];
+                int write;
+                if (problem->A.values[p] == 0.0 || position < 0 ||
+                    !prefos_internal_term_is_active_in_row(
+                        presolver, row, column))
+                    continue;
+                write = cursor[position]++;
+                state->adjacent_rows[write] = (int) row;
+                state->adjacent_positions[write] = p;
+            }
+        }
+        free(cursor);
     }
-    free(cursor);
     {
         long double budget =
             (long double) active_nnz *
@@ -252,26 +553,38 @@ initialize_linear_propagation_state(PreFOSPresolver *presolver,
     return PREFOS_STATUS_OK;
 }
 
-static PreFOSStatus update_cached_activity_term(long double *finite_sum,
-                                             size_t *n_infinite, double coefficient,
-                                             double old_bound, double new_bound)
+static PreFOSStatus update_cached_activity_term(
+    double *finite_sum, size_t *n_infinite, double coefficient,
+    double old_bound, double new_bound)
 {
-    long double update;
+    double update;
     if (isinf(old_bound))
     {
         if (!isfinite(new_bound) || *n_infinite == 0)
             return PREFOS_STATUS_NUMERICAL_ERROR;
         --(*n_infinite);
-        update = (long double) coefficient * (long double) new_bound;
+        update = coefficient * new_bound;
     }
     else
     {
         if (!isfinite(new_bound)) return PREFOS_STATUS_NUMERICAL_ERROR;
-        update = (long double) coefficient *
-                 ((long double) new_bound - (long double) old_bound);
+        update = coefficient * (new_bound - old_bound);
     }
     *finite_sum += update;
-    return isfinite(*finite_sum) ? PREFOS_STATUS_OK : PREFOS_STATUS_NUMERICAL_ERROR;
+    return isfinite(*finite_sum) ? PREFOS_STATUS_OK
+                                 : PREFOS_STATUS_NUMERICAL_ERROR;
+}
+
+static PreFOSStatus update_cached_infinite_count(
+    size_t *n_infinite, double old_bound, double new_bound)
+{
+    if (!isfinite(new_bound)) return PREFOS_STATUS_NUMERICAL_ERROR;
+    if (isinf(old_bound))
+    {
+        if (*n_infinite == 0) return PREFOS_STATUS_NUMERICAL_ERROR;
+        --(*n_infinite);
+    }
+    return PREFOS_STATUS_OK;
 }
 
 static PreFOSStatus update_cached_activities_for_bound_change(
@@ -279,9 +592,26 @@ static PreFOSStatus update_cached_activities_for_bound_change(
     double old_bound, double new_bound, int is_lower)
 {
     const PreFOSCsrMatrix *A = &presolver->original.A;
-    size_t degree = (size_t) (state->box_column_pointers[box_position + 1] -
-                              state->box_column_pointers[box_position]);
+    int adjacency_start, adjacency_end;
+    int column = presolver->original.box_indices[box_position];
+    int can_exclude_source_term =
+        presolver->is_substituted[column] &&
+        presolver->substitution_keeps_source_row[column];
+    size_t degree;
     int adjacency;
+    if (state->column_workspace)
+    {
+        adjacency_start = state->column_workspace->starts[column];
+        adjacency_end = state->column_workspace->ends[column];
+    }
+    else
+    {
+        adjacency_start = state->box_column_pointers[box_position];
+        adjacency_end = state->box_column_pointers[box_position + 1];
+    }
+    degree = state->column_workspace
+                 ? (size_t) state->column_workspace->live_degrees[column]
+                 : (size_t) (adjacency_end - adjacency_start);
     if (state->activity_updates_used > state->activity_update_budget ||
         degree > state->activity_update_budget - state->activity_updates_used)
     {
@@ -299,25 +629,47 @@ static PreFOSStatus update_cached_activities_for_bound_change(
             return PREFOS_STATUS_OK;
         }
     }
-    for (adjacency = state->box_column_pointers[box_position];
-         adjacency < state->box_column_pointers[box_position + 1]; ++adjacency)
+    for (adjacency = adjacency_start;
+         adjacency < adjacency_end; ++adjacency)
     {
-        int row = state->adjacent_rows[adjacency];
-        int position = state->adjacent_positions[adjacency];
-        double coefficient = A->values[position];
+        int row = state->column_workspace
+                      ? state->column_workspace->rows[adjacency]
+                      : state->adjacent_rows[adjacency];
         PreFOSRowActivity *activity = &state->activities[row];
-        PreFOSStatus status;
-        if ((is_lower && coefficient > 0.0) || (!is_lower && coefficient < 0.0))
-            status = update_cached_activity_term(&activity->finite_min,
-                                                 &activity->n_infinite_min,
-                                                 coefficient, old_bound, new_bound);
-        else
-            status = update_cached_activity_term(&activity->finite_max,
-                                                 &activity->n_infinite_max,
-                                                 coefficient, old_bound, new_bound);
+        PreFOSStatus status = PREFOS_STATUS_OK;
+        if (presolver->remove_rows[row]) continue;
+        if (can_exclude_source_term &&
+            presolver->substitution_source_row[column] == row)
+            continue;
+        if (row == state->current_row || isinf(old_bound))
+        {
+            double coefficient =
+                state->column_workspace
+                    ? state->column_workspace->values[adjacency]
+                    : A->values[state->adjacent_positions[adjacency]];
+            if ((is_lower && coefficient > 0.0) ||
+                (!is_lower && coefficient < 0.0))
+                status = row == state->current_row
+                             ? update_cached_activity_term(
+                                   &activity->finite_min,
+                                   &activity->n_infinite_min,
+                                   coefficient, old_bound, new_bound)
+                             : update_cached_infinite_count(
+                                   &activity->n_infinite_min,
+                                   old_bound, new_bound);
+            else
+                status = row == state->current_row
+                             ? update_cached_activity_term(
+                                   &activity->finite_max,
+                                   &activity->n_infinite_max,
+                                   coefficient, old_bound, new_bound)
+                             : update_cached_infinite_count(
+                                   &activity->n_infinite_max,
+                                   old_bound, new_bound);
+        }
         if (status != PREFOS_STATUS_OK) return status;
         ++presolver->stats.linear_activity_updates;
-
+        state->redundancy_activity_stale[row] = 1;
         if (!presolve_dirty_rows_schedule(&state->dirty_rows, row))
             return PREFOS_STATUS_OUT_OF_MEMORY;
     }
@@ -339,14 +691,13 @@ int prefos_internal_is_significant_improvement(const PreFOSPresolver *presolver,
                                             double current, double candidate,
                                             int is_lower)
 {
-    long double improvement, required;
+    double improvement, required;
     if (!isfinite(current)) return isfinite(candidate);
-    improvement = is_lower ? (long double) candidate - (long double) current
-                           : (long double) current - (long double) candidate;
+    improvement = is_lower ? candidate - current : current - candidate;
     required =
-        fmaxl((long double) presolver->settings.finite_bound_improvement_absolute,
-              (long double) presolver->settings.finite_bound_improvement_relative *
-                  fabsl((long double) current));
+        fmax(presolver->settings.finite_bound_improvement_absolute,
+             presolver->settings.finite_bound_improvement_relative *
+                 fabs(current));
     return improvement > required;
 }
 
@@ -484,26 +835,54 @@ static PresolveKernelUpdate tighten_prefos_scalar_bound(void *context_pointer,
 {
     PreFOSLinearKernelContext *context = (PreFOSLinearKernelContext *) context_pointer;
     size_t changes_before = context->presolver->stats.propagated_box_bounds;
-    double relaxed = relaxed_implied_bound(context->presolver, candidate, is_lower);
+    PreFOSPresolver *presolver = context->presolver;
+    int box_position = presolver->variable_to_box[column];
+    double relaxed;
+
+    if (context->state && box_position >= 0)
+    {
+        double opposite =
+            is_lower ? presolver->propagation_upper[column]
+                     : presolver->propagation_lower[column];
+        double column_scale =
+            context->state->column_workspace
+                ? context->state->column_workspace
+                      ->column_max_abs_coefficient[column]
+                : context->state
+                      ->box_max_abs_coefficient[box_position];
+        long double gap =
+            is_lower ? (long double) opposite - candidate
+                     : candidate - (long double) opposite;
+        if (isfinite(opposite) && column_scale > 0.0L && gap >= 0.0L &&
+            gap * (long double) column_scale <=
+                (long double) presolver->settings.feasibility_tolerance)
+            relaxed = opposite;
+        else
+            relaxed =
+                relaxed_implied_bound(presolver, candidate, is_lower);
+    }
+    else
+        relaxed = relaxed_implied_bound(presolver, candidate, is_lower);
 
     context->status =
         is_lower
-            ? update_propagated_lower(context->presolver, context->row, column,
+            ? update_propagated_lower(presolver, context->row, column,
                                       relaxed, context->changed, context->state)
-            : update_propagated_upper(context->presolver, context->row, column,
+            : update_propagated_upper(presolver, context->row, column,
                                       relaxed, context->changed, context->state);
     if (context->status != PREFOS_STATUS_OK ||
         (context->state && context->state->fallback_requested))
         return PRESOLVE_KERNEL_STOP;
-    return context->presolver->stats.propagated_box_bounds > changes_before
+    return presolver->stats.propagated_box_bounds > changes_before
                ? PRESOLVE_KERNEL_CHANGED
                : PRESOLVE_KERNEL_UNCHANGED;
 }
 
-static void refresh_prefos_linear_activity(void *context_pointer,
-                                        PresolveLinearPropagationRow *row)
+static void refresh_prefos_linear_activity(
+    void *context_pointer, PresolveLinearPropagationRow *row)
 {
-    PreFOSLinearKernelContext *context = (PreFOSLinearKernelContext *) context_pointer;
+    PreFOSLinearKernelContext *context =
+        (PreFOSLinearKernelContext *) context_pointer;
     const PreFOSRowActivity *activity;
     if (!context->state) return;
     activity = &context->state->activities[context->row];
@@ -525,7 +904,14 @@ static PreFOSStatus propagate_single_row(PreFOSPresolver *presolver, size_t row,
     PreFOSStatus status = check_row_activity(presolver, row, activity);
     int stopped;
 
-    if (status != PREFOS_STATUS_OK) return status;
+    if (status != PREFOS_STATUS_OK)
+    {
+        PreFOSRowActivity outward;
+        status = compute_row_activity(presolver, row, 1, &outward);
+        if (status != PREFOS_STATUS_OK) return status;
+        status = check_row_activity(presolver, row, &outward);
+        if (status != PREFOS_STATUS_OK) return status;
+    }
     if (!row_can_propagate(presolver, row, activity)) return PREFOS_STATUS_OK;
 
     context = (PreFOSLinearKernelContext){presolver, state, (int) row, changed,
@@ -548,6 +934,14 @@ static PreFOSStatus propagate_single_row(PreFOSPresolver *presolver, size_t row,
         .upper_bounds = presolver->propagation_upper,
         .bound_stride = sizeof(double),
         .candidate_map = presolver->variable_to_box,
+        .row_excluded_columns =
+            presolver->residual_source_column,
+        .row_exclusion_flags =
+            presolver->n_residual_row_substitutions > 0
+                ? presolver->substitution_keeps_source_row
+                : NULL,
+        .row_exclusion_sources = presolver->substitution_source_row,
+        .row_index = (int) row,
         .maximum_inferred_bound_magnitude =
             PRESOLVE_DEFAULT_MAX_INFERRED_BOUND_MAGNITUDE,
         .tighten_bound = tighten_prefos_scalar_bound,
@@ -575,6 +969,8 @@ static size_t active_linear_nonzeros(const PreFOSPresolver *presolver)
 static PreFOSStatus propagate_linear_bounds_full_scan(PreFOSPresolver *presolver,
                                                    int max_rounds, size_t work_limit)
 {
+    int integrate_redundancy =
+        scalar_redundancy_can_share_activity(presolver);
     int round;
     int stale_rounds = 0;
     size_t active_nnz = active_linear_nonzeros(presolver);
@@ -596,18 +992,41 @@ static PreFOSStatus propagate_linear_bounds_full_scan(PreFOSPresolver *presolver
         ++presolver->stats.linear_full_scan_rounds;
         for (row = 0; row < presolver->original.A.rows; ++row)
         {
-            PreFOSRowActivity activity;
+            PreFOSRowActivity activity, outward_activity;
             PreFOSStatus status;
+            int removed = 0;
+            if (!presolver->remove_rows[row] &&
+                !isfinite(presolver->working_constraint_lower[row]) &&
+                !isfinite(presolver->working_constraint_upper[row]) &&
+                integrate_redundancy)
+            {
+                prefos_internal_mark_removed_row(presolver, row);
+                ++presolver->stats.removed_redundant_rows;
+                continue;
+            }
             if (!row_is_active_for_linear_propagation(presolver, row)) continue;
-            status = compute_row_activity(presolver, row, 0, &activity);
+            status = compute_row_activities(
+                presolver, row, &activity, &outward_activity);
             if (status != PREFOS_STATUS_OK) return status;
             presolver->stats.linear_activity_nnz_computed += activity.n_nonzeros;
             ++presolver->stats.linear_rows_processed;
             presolver->stats.linear_nnz_processed += activity.n_nonzeros;
+            if (integrate_redundancy)
+            {
+                status = apply_scalar_row_classification(
+                    presolver, row, &outward_activity, &removed);
+                if (status != PREFOS_STATUS_OK) return status;
+                if (removed) continue;
+            }
             status = propagate_single_row(presolver, row, &activity, &changed, NULL);
             if (status != PREFOS_STATUS_OK) return status;
         }
-        if (!changed) break;
+        if (!changed)
+        {
+            if (integrate_redundancy)
+                presolver->scalar_redundancy_completed = 1;
+            break;
+        }
         {
             size_t changes = presolver->stats.propagated_box_bounds - changes_before;
             size_t work = linear_propagation_work_used(presolver) - work_before;
@@ -786,7 +1205,9 @@ static int prefer_full_scan_linear_propagation(const PreFOSPresolver *presolver)
            (long double) presolver->settings.event_queue_max_average_column_degree;
 }
 
-PreFOSStatus prefos_internal_propagate_linear_bounds(PreFOSPresolver *presolver)
+PreFOSStatus prefos_internal_propagate_linear_bounds(
+    PreFOSPresolver *presolver,
+    const PreFOSColumnWorkspace *column_workspace)
 {
     PreFOSLinearPropagationState state;
     PreFOSStatus status;
@@ -797,11 +1218,11 @@ PreFOSStatus prefos_internal_propagate_linear_bounds(PreFOSPresolver *presolver)
         presolver->settings.max_linear_propagation_rounds == 0 ||
         presolver->original.A.rows == 0)
         return PREFOS_STATUS_OK;
-
     work_limit = linear_propagation_work_limit(presolver);
     if (prefer_full_scan_linear_propagation(presolver))
     {
-        if (presolver->settings.linear_propagation_gpu)
+        if (presolver->settings.linear_propagation_gpu &&
+            presolver->n_residual_row_substitutions == 0)
             return propagate_linear_bounds_gpu(
                 presolver, presolver->settings.max_linear_propagation_rounds,
                 work_limit);
@@ -816,13 +1237,17 @@ PreFOSStatus prefos_internal_propagate_linear_bounds(PreFOSPresolver *presolver)
         return PREFOS_STATUS_OK;
     }
 
-    status = initialize_linear_propagation_state(presolver, &state);
+    status = initialize_linear_propagation_state(
+        presolver, &state, column_workspace);
     if (status != PREFOS_STATUS_OK)
     {
         free_linear_propagation_state(&state);
         return status;
     }
     state.total_work_limit = work_limit;
+    if (state.integrate_redundancy &&
+        state.dirty_rows.current_count == 0)
+        presolver->scalar_redundancy_completed = 1;
     for (round = 1; round <= presolver->settings.max_linear_propagation_rounds &&
                     state.dirty_rows.current_count > 0;
          ++round)
@@ -835,8 +1260,12 @@ PreFOSStatus prefos_internal_propagate_linear_bounds(PreFOSPresolver *presolver)
         while (presolve_dirty_rows_pop(&state.dirty_rows, &row))
         {
             int changed = 0;
+            int removed = 0;
             size_t row_work = state.activities[row].n_nonzeros;
             size_t used = linear_propagation_work_used(presolver);
+            if (!row_is_active_for_linear_propagation(
+                    presolver, (size_t) row))
+                continue;
             if (work_limit != SIZE_MAX &&
                 (used > work_limit || row_work > work_limit - used))
             {
@@ -847,8 +1276,59 @@ PreFOSStatus prefos_internal_propagate_linear_bounds(PreFOSPresolver *presolver)
             ++presolver->stats.linear_rows_processed;
             presolver->stats.linear_nnz_processed +=
                 state.activities[row].n_nonzeros;
+            if (state.redundancy_activity_stale[row])
+            {
+                if (row_can_propagate(
+                        presolver, (size_t) row,
+                        &state.activities[row]))
+                {
+                    status = compute_row_activity(
+                        presolver, (size_t) row, 0,
+                        &state.activities[row]);
+                    if (status != PREFOS_STATUS_OK)
+                    {
+                        free_linear_propagation_state(&state);
+                        return status;
+                    }
+                    presolver->stats.linear_activity_nnz_computed +=
+                        state.activities[row].n_nonzeros;
+                }
+                if (state.integrate_redundancy)
+                {
+                    int recomputed;
+                    status = refresh_rigorous_activity_if_needed(
+                        presolver, (size_t) row,
+                        &state.activities[row],
+                        &state.redundancy_activities[row],
+                        &recomputed);
+                    if (status != PREFOS_STATUS_OK)
+                    {
+                        free_linear_propagation_state(&state);
+                        return status;
+                    }
+                    if (recomputed)
+                        presolver->stats.linear_activity_nnz_computed +=
+                            state.activities[row].n_nonzeros;
+                }
+                state.redundancy_activity_stale[row] = 0;
+            }
+            if (state.integrate_redundancy)
+            {
+                status = apply_scalar_row_classification(
+                    presolver, (size_t) row,
+                    &state.redundancy_activities[row],
+                    &removed);
+                if (status != PREFOS_STATUS_OK)
+                {
+                    free_linear_propagation_state(&state);
+                    return status;
+                }
+                if (removed) continue;
+            }
+            state.current_row = row;
             status = propagate_single_row(presolver, (size_t) row,
                                           &state.activities[row], &changed, &state);
+            state.current_row = -1;
             if (status != PREFOS_STATUS_OK)
             {
                 free_linear_propagation_state(&state);
@@ -881,11 +1361,70 @@ PreFOSStatus prefos_internal_propagate_linear_bounds(PreFOSPresolver *presolver)
             }
         }
     }
+    if (state.integrate_redundancy &&
+        state.dirty_rows.current_count == 0)
+        presolver->scalar_redundancy_completed = 1;
     free_linear_propagation_state(&state);
     return PREFOS_STATUS_OK;
 }
 
-PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *presolver)
+static PreFOSStatus mark_cone_activity_candidate_rows(
+    const PreFOSPresolver *presolver,
+    const PreFOSColumnWorkspace *column_workspace,
+    const int *column_to_cone,
+    unsigned char *candidate_rows)
+{
+    const PreFOSProblemData *problem = &presolver->original;
+    size_t cone_index;
+    if (column_workspace)
+    {
+        for (cone_index = 0; cone_index < problem->n_cones; ++cone_index)
+        {
+            const PreFOSConeBlock *cone = &problem->cones[cone_index];
+            size_t coordinate;
+            if (presolver->converted_affine_cones[cone_index]) continue;
+            for (coordinate = 0; coordinate < cone->dimension; ++coordinate)
+            {
+                int column = cone->indices[coordinate];
+                int position;
+                for (position = column_workspace->starts[column];
+                     position < column_workspace->ends[column]; ++position)
+                {
+                    int row = column_workspace->rows[position];
+                    if (!presolver->remove_rows[row] &&
+                        column_workspace->values[position] != 0.0 &&
+                        prefos_internal_term_is_active_in_row(
+                            presolver, (size_t) row, column))
+                        candidate_rows[row] = 1;
+                }
+            }
+        }
+        return PREFOS_STATUS_OK;
+    }
+    for (size_t row = 0; row < problem->A.rows; ++row)
+    {
+        int position;
+        if (presolver->remove_rows[row]) continue;
+        for (position = problem->A.row_pointers[row];
+             position < problem->A.row_pointers[row + 1]; ++position)
+        {
+            int column = problem->A.column_indices[position];
+            if (problem->A.values[position] != 0.0 &&
+                column_to_cone[column] >= 0 &&
+                prefos_internal_term_is_active_in_row(
+                    presolver, row, column))
+            {
+                candidate_rows[row] = 1;
+                break;
+            }
+        }
+    }
+    return PREFOS_STATUS_OK;
+}
+
+PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(
+    PreFOSPresolver *presolver,
+    const PreFOSColumnWorkspace *column_workspace)
 {
     const PreFOSProblemData *problem = &presolver->original;
     PreFOSConeActivityWorkspace workspace;
@@ -893,11 +1432,16 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
     const double *activity_lower = presolver->propagation_lower;
     const double *activity_upper = presolver->propagation_upper;
     unsigned char *gpu_row_flags = NULL;
+    unsigned char *cone_candidate_rows = NULL;
     PreFOSStatus result;
     size_t row, box_position;
     int gpu_activity_valid = 0;
     int over_cpu_budget;
     if (!presolver->settings.remove_redundant_rows) return PREFOS_STATUS_OK;
+    if (presolver->scalar_redundancy_completed &&
+        !(problem->n_cones > 0 &&
+          presolver->settings.cone_aware_row_activity))
+        return PREFOS_STATUS_OK;
     over_cpu_budget =
         presolver->settings.redundant_row_max_average_nnz > 0.0 &&
         (long double) problem->A.nnz >
@@ -949,6 +1493,21 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
         }
         workspace.lower_bounds = activity_lower;
         workspace.upper_bounds = activity_upper;
+        if (column_workspace ||
+            presolver->scalar_redundancy_completed)
+        {
+            cone_candidate_rows = (unsigned char *) calloc(
+                problem->A.rows, sizeof(unsigned char));
+            if (problem->A.rows > 0 && !cone_candidate_rows)
+            {
+                result = PREFOS_STATUS_OUT_OF_MEMORY;
+                goto cleanup;
+            }
+            result = mark_cone_activity_candidate_rows(
+                presolver, column_workspace, workspace.column_to_cone,
+                cone_candidate_rows);
+            if (result != PREFOS_STATUS_OK) goto cleanup;
+        }
     }
     if (presolver->settings.structural_reductions_gpu)
     {
@@ -995,12 +1554,16 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
 
     for (row = 0; row < problem->A.rows; ++row)
     {
-        PreFOSRowActivity activity;
+        PreFOSRowActivity activity, exact_activity;
         int lower_implied, upper_implied;
         int cone_support_strengthened = 0;
+        int use_cone_activity;
         PresolveLinearRowState row_state;
         PreFOSStatus status;
         if (presolver->remove_rows[row]) continue;
+        if (presolver->scalar_redundancy_completed &&
+            cone_candidate_rows && !cone_candidate_rows[row])
+            continue;
         if (gpu_activity_valid && gpu_row_flags[row] == 0) continue;
         if (!isfinite(presolver->working_constraint_lower[row]) &&
             !isfinite(presolver->working_constraint_upper[row]))
@@ -1018,18 +1581,30 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
             }
             if (has_nonzero)
             {
-                presolver->remove_rows[row] = 1;
+                prefos_internal_mark_removed_row(presolver, row);
                 ++presolver->stats.removed_redundant_rows;
             }
             continue;
         }
-        status =
-            problem->n_cones > 0 && presolver->settings.cone_aware_row_activity
-                ? prefos_internal_compute_cone_aware_row_activity(presolver, row, 1,
-                                                               &workspace, &activity)
-                : compute_row_activity_with_bounds(presolver, row, 1, activity_lower,
-                                                   activity_upper, &activity);
-        if (problem->n_cones > 0 && presolver->settings.cone_aware_row_activity)
+        use_cone_activity =
+            problem->n_cones > 0 &&
+            presolver->settings.cone_aware_row_activity &&
+            (!cone_candidate_rows || cone_candidate_rows[row]);
+        if (use_cone_activity)
+        {
+            status = prefos_internal_compute_cone_aware_row_activity(
+                presolver, row, 0, 1, &workspace, &activity);
+            if (status == PREFOS_STATUS_OK &&
+                activity_needs_rigorous_confirmation(
+                    presolver, row, &activity))
+                status = prefos_internal_compute_cone_aware_row_activity(
+                    presolver, row, 1, 0, &workspace, &activity);
+        }
+        else
+            status = compute_row_activities_with_bounds(
+                presolver, row, activity_lower, activity_upper,
+                &exact_activity, &activity);
+        if (use_cone_activity)
             cone_support_strengthened = workspace.row_support_strengthened;
         if (status != PREFOS_STATUS_OK)
         {
@@ -1054,7 +1629,7 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
         upper_implied = (row_state & PRESOLVE_ROW_UPPER_REDUNDANT) != 0;
         if (lower_implied && upper_implied)
         {
-            presolver->remove_rows[row] = 1;
+            prefos_internal_mark_removed_row(presolver, row);
             ++presolver->stats.removed_redundant_rows;
             if (cone_support_strengthened)
                 ++presolver->stats.cone_activity_rows_removed;
@@ -1075,6 +1650,7 @@ PreFOSStatus prefos_internal_remove_redundant_rows_by_activity(PreFOSPresolver *
 cleanup:
     prefos_internal_cone_activity_workspace_free(&workspace);
     free(gpu_row_flags);
+    free(cone_candidate_rows);
     free(retained_lower);
     free(retained_upper);
     return result;

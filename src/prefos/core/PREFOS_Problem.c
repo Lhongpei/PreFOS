@@ -806,7 +806,7 @@ PreFOSSettings prefos_default_settings(void)
     settings.psd_block_decomposition = 1;
     settings.remove_empty_columns = 1;
     settings.singleton_column_reduction = 1;
-    settings.bounded_doubleton_substitution = 0;
+    settings.bounded_doubleton_substitution = 1;
     settings.dual_fixing = 1;
     settings.parallel_column_reduction = 1;
     settings.remove_redundant_bounds = 1;
@@ -886,6 +886,7 @@ void prefos_free_presolver(PreFOSPresolver *presolver)
     free(presolver->original_to_reduced_rows);
     free(presolver->fixed_values);
     free(presolver->is_fixed);
+    free(presolver->fixed_column_log);
     free(presolver->is_substituted);
     free(presolver->is_parallel_removed);
     free(presolver->substitution_term_count);
@@ -893,6 +894,7 @@ void prefos_free_presolver(PreFOSPresolver *presolver)
     free(presolver->substitution_keeps_source_row);
     free(presolver->substitution_term_start);
     free(presolver->substitution_source_row);
+    free(presolver->residual_source_column);
     free(presolver->substitution_constant);
     free(presolver->substitution_targets);
     free(presolver->substitution_scales);
@@ -915,6 +917,7 @@ void prefos_free_presolver(PreFOSPresolver *presolver)
     free(presolver->affine_face_substitution_targets);
     free(presolver->affine_face_eliminated_columns);
     free(presolver->remove_rows);
+    free(presolver->removed_row_log);
     free(presolver->remove_cones);
     free(presolver->cone_face_survivors);
     free(presolver->cone_face_box);

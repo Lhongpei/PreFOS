@@ -9,10 +9,12 @@
 #include "core/PREFOS_AffineConeCompaction.h"
 #include "core/PREFOS_AffineConeFaces.h"
 #include "core/PREFOS_MatrixCompaction.h"
+#include "core/PREFOS_PassManager.h"
 #include "core/PREFOS_Timer.h"
 #include "explorers/PREFOS_AffineConeAggregation.h"
 #include "explorers/PREFOS_AffineFaceSubstitution.h"
 #include "explorers/PREFOS_ConePropagation.h"
+#include "explorers/PREFOS_ColumnReductionInternal.h"
 #include "explorers/PREFOS_ColumnReductions.h"
 #include "explorers/PREFOS_CudaBackend.h"
 #include "explorers/PREFOS_CudaLinearPropagation.h"
@@ -20,6 +22,7 @@
 #include "explorers/PREFOS_LinearPropagation.h"
 #include "explorers/PREFOS_ParallelRows.h"
 #include "explorers/PREFOS_SDPStructureAnalysis.h"
+#include "explorers/PREFOS_TrivialReductions.h"
 
 int prefos_gpu_warmup(void)
 {
@@ -46,16 +49,6 @@ void prefos_gpu_release_cache(void)
     prefos_cuda_linear_propagation_release_cache();
 }
 
-static int is_close_bound(double lower, double upper, double tolerance)
-{
-    long double difference, scale;
-    if (!isfinite(lower) || !isfinite(upper)) return 0;
-    difference = (long double) upper - (long double) lower;
-    scale =
-        fmaxl(1.0L, fmaxl(fabsl((long double) lower), fabsl((long double) upper)));
-    return difference <= (long double) tolerance * scale;
-}
-
 static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
 {
     size_t i;
@@ -67,12 +60,14 @@ static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
     presolver->fixed_values = (double *) calloc(problem->n, sizeof(double));
     presolver->is_fixed =
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
+    presolver->fixed_column_log =
+        (int *) prefos_internal_alloc_array(problem->n, sizeof(int));
     presolver->is_substituted =
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     presolver->is_parallel_removed =
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     presolver->substitution_term_count =
-        (unsigned char *) calloc(problem->n, sizeof(unsigned char));
+        (size_t *) calloc(problem->n, sizeof(size_t));
     presolver->substitution_incoming_depth =
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     presolver->substitution_keeps_source_row =
@@ -81,6 +76,8 @@ static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
         (size_t *) calloc(problem->n, sizeof(size_t));
     presolver->substitution_source_row =
         (int *) prefos_internal_alloc_array(problem->n, sizeof(int));
+    presolver->residual_source_column =
+        (int *) prefos_internal_alloc_array(problem->A.rows, sizeof(int));
     presolver->substitution_constant = (double *) calloc(problem->n, sizeof(double));
     presolver->variable_to_box =
         (int *) prefos_internal_alloc_array(problem->n, sizeof(int));
@@ -114,6 +111,8 @@ static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
         (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     presolver->remove_rows =
         (unsigned char *) calloc(problem->A.rows, sizeof(unsigned char));
+    presolver->removed_row_log =
+        (int *) prefos_internal_alloc_array(problem->A.rows, sizeof(int));
     presolver->remove_cones =
         (unsigned char *) calloc(problem->n_cones, sizeof(unsigned char));
     presolver->cone_face_survivors =
@@ -132,7 +131,8 @@ static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
         problem->n_cones, sizeof(PreFOSFacialReductionCertificate));
     if (problem->n > 0 &&
         (!presolver->original_to_reduced || !presolver->fixed_values ||
-         !presolver->is_fixed || !presolver->is_substituted ||
+         !presolver->is_fixed || !presolver->fixed_column_log ||
+         !presolver->is_substituted ||
          !presolver->is_parallel_removed ||
          !presolver->substitution_term_count ||
          !presolver->substitution_incoming_depth ||
@@ -154,10 +154,12 @@ static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
     }
     if ((problem->A.rows > 0 && (!presolver->original_to_reduced_rows ||
                                  !presolver->working_constraint_lower ||
-                                 !presolver->working_constraint_upper)) ||
+                                 !presolver->working_constraint_upper ||
+                                 !presolver->residual_source_column)) ||
         (problem->n_box > 0 &&
          (!presolver->working_box_lower || !presolver->working_box_upper)) ||
-        (problem->A.rows > 0 && !presolver->remove_rows) ||
+        (problem->A.rows > 0 &&
+         (!presolver->remove_rows || !presolver->removed_row_log)) ||
         (problem->n_cones > 0 &&
          (!presolver->converted_affine_cones || !presolver->remove_cones ||
           !presolver->generated_affine_rsoc_zero_axis ||
@@ -184,6 +186,7 @@ static PreFOSStatus initialize_working_state(PreFOSPresolver *presolver)
     for (i = 0; i < problem->A.rows; ++i)
     {
         presolver->original_to_reduced_rows[i] = -1;
+        presolver->residual_source_column[i] = -1;
         presolver->working_constraint_lower[i] = problem->constraint_lower[i];
         presolver->working_constraint_upper[i] = problem->constraint_upper[i];
     }
@@ -256,119 +259,6 @@ PreFOSStatus prefos_internal_append_bound_record(PreFOSPresolver *presolver, int
                : PREFOS_STATUS_OUT_OF_MEMORY;
 }
 
-static PreFOSStatus tighten_singleton_box_rows(PreFOSPresolver *presolver)
-{
-    size_t row;
-    const PreFOSProblemData *problem = &presolver->original;
-
-    for (row = 0; row < problem->A.rows; ++row)
-    {
-        int p, singleton_column = -1;
-        double coefficient = 0.0;
-        size_t nonzeros = 0;
-        int box_position;
-        double implied_lower, implied_upper;
-        double *lower, *upper;
-        double old_lower, old_upper, new_lower, new_upper;
-        PreFOSStatus status;
-
-        for (p = problem->A.row_pointers[row]; p < problem->A.row_pointers[row + 1];
-             ++p)
-        {
-            if (problem->A.values[p] == 0.0) continue;
-            singleton_column = problem->A.column_indices[p];
-            coefficient = problem->A.values[p];
-            if (++nonzeros > 1) break;
-        }
-        if (nonzeros != 1) continue;
-        box_position = presolver->variable_to_box[singleton_column];
-        if (box_position < 0) continue;
-
-        if (coefficient > 0.0)
-        {
-            implied_lower = prefos_internal_outward_bound_cast(
-                (long double) problem->constraint_lower[row] /
-                    (long double) coefficient,
-                1);
-            implied_upper = prefos_internal_outward_bound_cast(
-                (long double) problem->constraint_upper[row] /
-                    (long double) coefficient,
-                0);
-        }
-        else
-        {
-            implied_lower = prefos_internal_outward_bound_cast(
-                (long double) problem->constraint_upper[row] /
-                    (long double) coefficient,
-                1);
-            implied_upper = prefos_internal_outward_bound_cast(
-                (long double) problem->constraint_lower[row] /
-                    (long double) coefficient,
-                0);
-        }
-        if (implied_lower == INFINITY || implied_upper == -INFINITY)
-            return PREFOS_STATUS_PRIMAL_INFEASIBLE;
-        lower = &presolver->working_box_lower[box_position];
-        upper = &presolver->working_box_upper[box_position];
-        old_lower = *lower;
-        old_upper = *upper;
-        new_lower = fmax(old_lower, implied_lower);
-        new_upper = fmin(old_upper, implied_upper);
-        if (new_lower > new_upper + presolver->settings.feasibility_tolerance)
-            return PREFOS_STATUS_PRIMAL_INFEASIBLE;
-        if (new_lower > new_upper)
-        {
-            double midpoint = prefos_internal_safe_midpoint(new_lower, new_upper);
-            new_lower = midpoint;
-            new_upper = midpoint;
-        }
-
-        status = prefos_internal_append_bound_record(
-            presolver, (int) row, singleton_column, old_lower, new_lower, 1);
-        if (status != PREFOS_STATUS_OK) return status;
-        status = prefos_internal_append_bound_record(
-            presolver, (int) row, singleton_column, old_upper, new_upper, 0);
-        if (status != PREFOS_STATUS_OK) return status;
-        if (new_lower != old_lower) ++presolver->stats.tightened_box_bounds;
-        if (new_upper != old_upper) ++presolver->stats.tightened_box_bounds;
-        *lower = new_lower;
-        *upper = new_upper;
-
-        presolver->propagation_lower[singleton_column] = *lower;
-        presolver->propagation_upper[singleton_column] = *upper;
-
-        presolver->remove_rows[row] = 1;
-        ++presolver->stats.removed_singleton_rows;
-    }
-    return PREFOS_STATUS_OK;
-}
-
-static PreFOSStatus find_fixed_box_variables(PreFOSPresolver *presolver, size_t *n_fixed)
-{
-    size_t i;
-    const PreFOSProblemData *problem = &presolver->original;
-
-    *n_fixed = 0;
-    if (!presolver->settings.fix_close_box_bounds) return PREFOS_STATUS_OK;
-    for (i = 0; i < problem->n_box; ++i)
-    {
-        if (!presolver->is_fixed[problem->box_indices[i]] &&
-            !presolver->is_substituted[problem->box_indices[i]] &&
-            !presolver->is_parallel_removed[problem->box_indices[i]] &&
-            is_close_bound(presolver->working_box_lower[i],
-                           presolver->working_box_upper[i],
-                           presolver->settings.fixed_variable_tolerance))
-        {
-            int index = problem->box_indices[i];
-            presolver->is_fixed[index] = 1;
-            presolver->fixed_values[index] = prefos_internal_safe_midpoint(
-                presolver->working_box_lower[i], presolver->working_box_upper[i]);
-            ++(*n_fixed);
-        }
-    }
-    return PREFOS_STATUS_OK;
-}
-
 static void build_variable_map(PreFOSPresolver *presolver)
 {
     size_t i;
@@ -381,6 +271,62 @@ static void build_variable_map(PreFOSPresolver *presolver)
         else
             presolver->original_to_reduced[i] = next++;
     }
+}
+
+typedef struct
+{
+    size_t transformation_events;
+    size_t removed_rows;
+    size_t changed_bounds;
+    size_t cone_reductions;
+} PreFOSFastTriggerSignature;
+
+static PreFOSFastTriggerSignature capture_fast_trigger_signature(
+    const PreFOSPresolver *presolver)
+{
+    const PreFOSStats *stats = &presolver->stats;
+    PreFOSFastTriggerSignature signature;
+    signature.transformation_events = presolver->transformations.n_events;
+    signature.removed_rows =
+        stats->removed_redundant_rows +
+        stats->removed_singleton_rows +
+        stats->removed_empty_rows +
+        stats->removed_affine_cone_coordinates +
+        stats->removed_affine_cone_blocks;
+    signature.changed_bounds =
+        stats->tightened_box_bounds +
+        stats->propagated_box_bounds +
+        stats->tightened_cone_envelopes +
+        stats->tightened_affine_cone_envelopes +
+        stats->tightened_affine_variable_envelopes +
+        stats->materialized_affine_cone_box_bounds +
+        stats->fixed_affine_face_variables +
+        stats->removed_redundant_row_lower_sides +
+        stats->removed_redundant_row_upper_sides +
+        stats->removed_redundant_box_lower_bounds +
+        stats->removed_redundant_box_upper_bounds;
+    signature.cone_reductions =
+        stats->fixed_cone_variables +
+        stats->collapsed_cones +
+        stats->reduced_rsoc_faces +
+        stats->reduced_psd_faces +
+        stats->reduced_exponential_faces +
+        stats->reduced_power_faces +
+        stats->reduced_affine_rsoc_faces +
+        stats->reduced_affine_psd_faces +
+        stats->reduced_affine_exponential_faces +
+        stats->reduced_affine_power_faces;
+    return signature;
+}
+
+static int fast_trigger_signature_changed(
+    PreFOSFastTriggerSignature before,
+    PreFOSFastTriggerSignature after)
+{
+    return before.transformation_events != after.transformation_events ||
+           before.removed_rows != after.removed_rows ||
+           before.changed_bounds != after.changed_bounds ||
+           before.cone_reductions != after.cone_reductions;
 }
 
 static PreFOSStatus multiply_fixed_quadratic(const PreFOSPresolver *presolver,
@@ -680,6 +626,7 @@ accumulate_substituted_linear_objective(const PreFOSPresolver *presolver, int co
 {
     size_t term;
 
+    if (coefficient == 0.0) return PREFOS_STATUS_OK;
     if (column < 0 || (size_t) column >= presolver->original.n ||
         depth > PREFOS_MAX_SUBSTITUTION_DEPTH)
         return PREFOS_STATUS_NUMERICAL_ERROR;
@@ -691,9 +638,8 @@ accumulate_substituted_linear_objective(const PreFOSPresolver *presolver, int co
     if (presolver->is_substituted[column])
     {
         size_t start = presolver->substitution_term_start[column];
-        unsigned char count = presolver->substitution_term_count[column];
-        if (count == 0 || count > PREFOS_MAX_AGGREGATION_TERMS ||
-            start > presolver->n_substitution_terms ||
+        size_t count = presolver->substitution_term_count[column];
+        if (count == 0 || start > presolver->n_substitution_terms ||
             count > presolver->n_substitution_terms - start ||
             !prefos_internal_safe_add_product(target_offset, coefficient,
                                            presolver->substitution_constant[column]))
@@ -730,6 +676,7 @@ PreFOSStatus prefos_internal_expand_linear_objective(
     *offset = presolver->original.objective_offset;
     for (column = 0; column < presolver->original.n; ++column)
     {
+        if (presolver->original.c[column] == 0.0) continue;
         PreFOSStatus status = accumulate_substituted_linear_objective(
             presolver, (int) column, presolver->original.c[column], 0,
             objective, offset);
@@ -831,21 +778,106 @@ static PreFOSStatus build_reduced_objective(PreFOSPresolver *presolver)
     return PREFOS_STATUS_OK;
 }
 
+#define PREFOS_MAX_MEDIUM_FIXED_POINT_ROUNDS 3
+
+static PreFOSStatus run_medium_reduction_pass(
+    PreFOSPresolver *presolver, int include_parallel_rows,
+    int include_row_redundancy,
+    int *changed_after_linear,
+    PreFOSColumnWorkspace *shared_workspace)
+{
+    PreFOSFastTriggerSignature after_linear;
+    PreFOSTimestamp start, stop;
+    PreFOSStatus status;
+
+    *changed_after_linear = 0;
+    if (include_parallel_rows)
+    {
+        status = prefos_internal_remove_parallel_rows(presolver);
+        if (status != PREFOS_STATUS_OK) return status;
+    }
+    if (shared_workspace)
+        prefos_internal_update_column_live_degrees(
+            presolver, shared_workspace);
+    prefos_internal_timer_now(&start);
+    status = prefos_internal_propagate_linear_bounds(
+        presolver, shared_workspace);
+    prefos_internal_timer_now(&stop);
+    presolver->stats.linear_propagation_milliseconds +=
+        prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+    if (status != PREFOS_STATUS_OK) return status;
+    after_linear = capture_fast_trigger_signature(presolver);
+
+    if (include_row_redundancy)
+    {
+        prefos_internal_timer_now(&start);
+        status = prefos_internal_remove_redundant_rows_by_activity(
+            presolver, shared_workspace);
+        prefos_internal_timer_now(&stop);
+        presolver->stats.redundant_row_activity_milliseconds +=
+            prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+        if (status != PREFOS_STATUS_OK) return status;
+        presolver->scalar_redundancy_completed = 1;
+    }
+
+    prefos_internal_timer_now(&start);
+    status = prefos_internal_propagate_cone_envelopes(presolver);
+    prefos_internal_timer_now(&stop);
+    presolver->stats.cone_propagation_milliseconds +=
+        prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+    if (status != PREFOS_STATUS_OK) return status;
+
+    prefos_internal_timer_now(&start);
+    status = prefos_internal_detect_zero_cone_collapses(presolver);
+    prefos_internal_timer_now(&stop);
+    presolver->stats.cone_collapse_milliseconds +=
+        prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+    if (status != PREFOS_STATUS_OK) return status;
+
+    status = prefos_internal_remove_redundant_box_bounds(presolver);
+    if (status != PREFOS_STATUS_OK) return status;
+    *changed_after_linear = fast_trigger_signature_changed(
+        after_linear, capture_fast_trigger_signature(presolver));
+    return PREFOS_STATUS_OK;
+}
+
+static PreFOSStatus run_fast_fixed_point_timed(
+    PreFOSPresolver *presolver, int allow_one_sided_singletons,
+    int full_trivial_scan, PreFOSColumnWorkspace *shared_workspace)
+{
+    PreFOSTimestamp start, stop;
+    PreFOSStatus status;
+    prefos_internal_timer_now(&start);
+    status = prefos_internal_run_fast_fixed_point(
+        presolver, allow_one_sided_singletons, full_trivial_scan,
+        shared_workspace);
+    prefos_internal_timer_now(&stop);
+    presolver->stats.fast_fixed_point_milliseconds +=
+        prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+    return status;
+}
+
 PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
 {
     PreFOSStatus status;
-    size_t n_fixed_box, n_fixed_total = 0, n_substituted_total = 0;
+    size_t n_fixed_total = 0, n_substituted_total = 0;
     size_t n_parallel_removed = 0, i;
+    size_t fixed_affine_before_substitution;
     const PreFOSProblemData *source;
     PreFOSPresolvedProblem *target;
+    PreFOSColumnWorkspace shared_column_workspace;
+    int shared_column_workspace_valid = 0;
+    PreFOSTimestamp presolve_start, phase_start, phase_stop;
 
     if (!presolver) return PREFOS_STATUS_INVALID_ARGUMENT;
+    memset(&shared_column_workspace, 0, sizeof(shared_column_workspace));
     prefos_internal_cuda_workspace_release(presolver);
     prefos_internal_free_reduced_problem(&presolver->reduced);
     free(presolver->original_to_reduced);
     free(presolver->original_to_reduced_rows);
     free(presolver->fixed_values);
     free(presolver->is_fixed);
+    free(presolver->fixed_column_log);
     free(presolver->is_substituted);
     free(presolver->is_parallel_removed);
     free(presolver->substitution_term_count);
@@ -853,6 +885,7 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     free(presolver->substitution_keeps_source_row);
     free(presolver->substitution_term_start);
     free(presolver->substitution_source_row);
+    free(presolver->residual_source_column);
     free(presolver->substitution_constant);
     free(presolver->substitution_targets);
     free(presolver->substitution_scales);
@@ -875,6 +908,7 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     free(presolver->affine_face_substitution_targets);
     free(presolver->affine_face_eliminated_columns);
     free(presolver->remove_rows);
+    free(presolver->removed_row_log);
     free(presolver->remove_cones);
     free(presolver->cone_face_survivors);
     free(presolver->cone_face_box);
@@ -889,6 +923,8 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     presolver->original_to_reduced_rows = NULL;
     presolver->fixed_values = NULL;
     presolver->is_fixed = NULL;
+    presolver->fixed_column_log = NULL;
+    presolver->n_fixed_columns = 0;
     presolver->is_substituted = NULL;
     presolver->is_parallel_removed = NULL;
     presolver->substitution_term_count = NULL;
@@ -896,11 +932,13 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     presolver->substitution_keeps_source_row = NULL;
     presolver->substitution_term_start = NULL;
     presolver->substitution_source_row = NULL;
+    presolver->residual_source_column = NULL;
     presolver->substitution_constant = NULL;
     presolver->substitution_targets = NULL;
     presolver->substitution_scales = NULL;
     presolver->n_substitution_terms = 0;
     presolver->substitution_term_capacity = 0;
+    presolver->n_residual_row_substitutions = 0;
     presolver->n_parallel_column_reductions = 0;
     presolver->variable_to_box = NULL;
     presolver->working_box_lower = NULL;
@@ -926,6 +964,8 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     presolver->affine_face_eliminated_columns = NULL;
     presolver->n_affine_face_substitutions = 0;
     presolver->remove_rows = NULL;
+    presolver->removed_row_log = NULL;
+    presolver->n_removed_rows = 0;
     presolver->remove_cones = NULL;
     presolver->cone_face_survivors = NULL;
     presolver->cone_face_box = NULL;
@@ -937,7 +977,10 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     presolver->n_facial_reductions = 0;
     presolve_transformation_log_init(&presolver->transformations);
     memset(&presolver->stats, 0, sizeof(presolver->stats));
+    presolver->scalar_redundancy_completed = 0;
+    presolver->fixed_column_epoch = 0;
     presolver->has_run = 0;
+    prefos_internal_timer_now(&presolve_start);
 
     source = &presolver->original;
     target = &presolver->reduced;
@@ -951,20 +994,62 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     presolver->stats.normalized_nonnegative_cones =
         presolver->normalized_nonnegative_cones;
 
+    prefos_internal_timer_now(&phase_start);
     status = initialize_working_state(presolver);
-    if (status != PREFOS_STATUS_OK) goto failure;
-    status = prefos_internal_reduce_linear_columns(presolver);
+    prefos_internal_timer_now(&phase_stop);
+    presolver->stats.initialization_milliseconds =
+        prefos_internal_timer_elapsed_milliseconds(
+            &phase_start, &phase_stop);
     if (status != PREFOS_STATUS_OK) goto failure;
     {
         size_t aggregations_before =
             presolver->stats.aggregated_affine_cone_coordinates;
+        prefos_internal_timer_now(&phase_start);
         status =
             prefos_internal_aggregate_affine_cone_coordinates(presolver);
+        prefos_internal_timer_now(&phase_stop);
+        presolver->stats.affine_aggregation_milliseconds =
+            prefos_internal_timer_elapsed_milliseconds(
+                &phase_start, &phase_stop);
         if (presolver->stats.aggregated_affine_cone_coordinates >
             aggregations_before)
             prefos_internal_cuda_workspace_release(presolver);
     }
     if (status != PREFOS_STATUS_OK) goto failure;
+    {
+        size_t ignored_fixed;
+        status = prefos_internal_find_fixed_box_variables(
+            presolver, &ignored_fixed);
+    }
+    if (status != PREFOS_STATUS_OK) goto failure;
+    if (source->n_box > 0)
+    {
+        prefos_internal_timer_now(&phase_start);
+        status = prefos_internal_build_column_workspace_cpu(
+            presolver, &shared_column_workspace);
+        prefos_internal_timer_now(&phase_stop);
+        presolver->stats.structural_reduction_milliseconds +=
+            prefos_internal_timer_elapsed_milliseconds(
+                &phase_start, &phase_stop);
+        if (status != PREFOS_STATUS_OK) goto failure;
+        shared_column_workspace_valid = 1;
+    }
+    if (source->A.rows > 0 && source->n >= 65536 &&
+        (long double) source->n >
+            8.0L * (long double) source->A.rows)
+    {
+        status = shared_column_workspace_valid
+                     ? prefos_internal_reduce_parallel_columns_in_workspace(
+                           presolver, &shared_column_workspace)
+                     : prefos_internal_reduce_parallel_columns(presolver);
+        if (status != PREFOS_STATUS_OK) goto failure;
+    }
+    status = run_fast_fixed_point_timed(
+        presolver, 0, 1,
+        shared_column_workspace_valid ? &shared_column_workspace : NULL);
+    if (status != PREFOS_STATUS_OK) goto failure;
+    fixed_affine_before_substitution =
+        presolver->stats.fixed_affine_face_variables;
     {
         PreFOSTimestamp start, stop;
         prefos_internal_timer_now(&start);
@@ -974,54 +1059,112 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
             prefos_internal_timer_elapsed_milliseconds(&start, &stop);
     }
     if (status != PREFOS_STATUS_OK) goto failure;
+    prefos_internal_timer_now(&phase_start);
     status = prefos_internal_substitute_free_columns(presolver);
+    prefos_internal_timer_now(&phase_stop);
+    presolver->stats.free_column_substitution_milliseconds =
+        prefos_internal_timer_elapsed_milliseconds(
+            &phase_start, &phase_stop);
     if (status != PREFOS_STATUS_OK) goto failure;
-    status = tighten_singleton_box_rows(presolver);
-    if (status != PREFOS_STATUS_OK) goto failure;
-    status = prefos_internal_remove_parallel_rows(presolver);
-    if (status != PREFOS_STATUS_OK) goto failure;
+    if (presolver->stats.fixed_affine_face_variables >
+        fixed_affine_before_substitution)
     {
-        PreFOSTimestamp start, stop;
-        prefos_internal_timer_now(&start);
-        status = prefos_internal_propagate_linear_bounds(presolver);
-        prefos_internal_timer_now(&stop);
-        presolver->stats.linear_propagation_milliseconds =
-            prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+        prefos_internal_timer_now(&phase_start);
+        status = prefos_internal_reduce_trivial_rows(presolver);
+        prefos_internal_timer_now(&phase_stop);
+        presolver->stats.trivial_row_reduction_milliseconds =
+            prefos_internal_timer_elapsed_milliseconds(
+                &phase_start, &phase_stop);
+        if (status != PREFOS_STATUS_OK) goto failure;
     }
-    if (status != PREFOS_STATUS_OK) goto failure;
     {
-        PreFOSTimestamp start, stop;
-        prefos_internal_timer_now(&start);
-        status = prefos_internal_remove_redundant_rows_by_activity(presolver);
-        prefos_internal_timer_now(&stop);
-        presolver->stats.redundant_row_activity_milliseconds =
-            prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+        int round;
+        prefos_internal_timer_now(&phase_start);
+        for (round = 0; round < PREFOS_MAX_MEDIUM_FIXED_POINT_ROUNDS;
+             ++round)
+        {
+            PreFOSFastTriggerSignature before_medium =
+                capture_fast_trigger_signature(presolver);
+            PreFOSFastTriggerSignature before_fast;
+            int changed_after_linear = 0;
+            int fast_changed = 0;
+            int fast_fixed_columns = 0;
+            size_t fixed_epoch_before_fast;
+            ++presolver->stats.medium_fixed_point_rounds;
+
+            status = run_medium_reduction_pass(
+                presolver, round == 0, round == 0,
+                &changed_after_linear,
+                shared_column_workspace_valid
+                    ? &shared_column_workspace
+                    : NULL);
+            if (status != PREFOS_STATUS_OK) goto failure;
+            if (source->A.rows == 0 || source->n_box == 0)
+                changed_after_linear = 0;
+            before_fast = capture_fast_trigger_signature(presolver);
+            fixed_epoch_before_fast = presolver->fixed_column_epoch;
+            if (fast_trigger_signature_changed(
+                    before_medium, before_fast))
+            {
+                status = run_fast_fixed_point_timed(
+                    presolver, 1, 0,
+                    shared_column_workspace_valid
+                        ? &shared_column_workspace
+                        : NULL);
+                if (status != PREFOS_STATUS_OK) goto failure;
+                fast_changed = fast_trigger_signature_changed(
+                    before_fast,
+                    capture_fast_trigger_signature(presolver));
+                fast_fixed_columns =
+                    presolver->fixed_column_epoch !=
+                    fixed_epoch_before_fast;
+            }
+            if (source->n_cones == 0 &&
+                source->n_affine_cones == 0)
+            {
+                if (fast_fixed_columns)
+                    presolver->scalar_redundancy_completed = 0;
+                else
+                    break;
+            }
+            if (!changed_after_linear && !fast_changed) break;
+        }
+        prefos_internal_timer_now(&phase_stop);
+        presolver->stats.medium_fixed_point_milliseconds =
+            prefos_internal_timer_elapsed_milliseconds(
+                &phase_start, &phase_stop);
     }
-    if (status != PREFOS_STATUS_OK) goto failure;
     {
-        PreFOSTimestamp start, stop;
-        prefos_internal_timer_now(&start);
-        status = prefos_internal_propagate_cone_envelopes(presolver);
-        prefos_internal_timer_now(&stop);
-        presolver->stats.cone_propagation_milliseconds =
-            prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+        PreFOSFastTriggerSignature before_parallel_columns =
+            capture_fast_trigger_signature(presolver);
+        prefos_internal_timer_now(&phase_start);
+        status = shared_column_workspace_valid
+                     ? prefos_internal_reduce_parallel_columns_in_workspace(
+                           presolver, &shared_column_workspace)
+                     : prefos_internal_reduce_parallel_columns(presolver);
+        prefos_internal_timer_now(&phase_stop);
+        presolver->stats.parallel_column_reduction_milliseconds =
+            prefos_internal_timer_elapsed_milliseconds(
+                &phase_start, &phase_stop);
+        if (status != PREFOS_STATUS_OK) goto failure;
+        if (fast_trigger_signature_changed(
+                before_parallel_columns,
+                capture_fast_trigger_signature(presolver)))
+        {
+            status = run_fast_fixed_point_timed(
+                presolver, 1, 0,
+                shared_column_workspace_valid
+                    ? &shared_column_workspace
+                    : NULL);
+            if (status != PREFOS_STATUS_OK) goto failure;
+        }
     }
-    if (status != PREFOS_STATUS_OK) goto failure;
+    if (shared_column_workspace_valid)
     {
-        PreFOSTimestamp start, stop;
-        prefos_internal_timer_now(&start);
-        status = prefos_internal_detect_zero_cone_collapses(presolver);
-        prefos_internal_timer_now(&stop);
-        presolver->stats.cone_collapse_milliseconds =
-            prefos_internal_timer_elapsed_milliseconds(&start, &stop);
+        prefos_internal_free_column_workspace(
+            &shared_column_workspace);
+        shared_column_workspace_valid = 0;
     }
-    if (status != PREFOS_STATUS_OK) goto failure;
-    status = prefos_internal_remove_redundant_box_bounds(presolver);
-    if (status != PREFOS_STATUS_OK) goto failure;
-    status = prefos_internal_reduce_parallel_columns(presolver);
-    if (status != PREFOS_STATUS_OK) goto failure;
-    status = find_fixed_box_variables(presolver, &n_fixed_box);
-    if (status != PREFOS_STATUS_OK) goto failure;
     for (i = 0; i < source->n; ++i)
     {
         if (presolver->is_fixed[i]) ++n_fixed_total;
@@ -1037,17 +1180,37 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     target->q_storage = source->q_storage;
     build_variable_map(presolver);
 
+    prefos_internal_timer_now(&phase_start);
     status = prefos_internal_compact_a(presolver);
+    prefos_internal_timer_now(&phase_stop);
+    presolver->stats.matrix_compaction_milliseconds =
+        prefos_internal_timer_elapsed_milliseconds(
+            &phase_start, &phase_stop);
     if (status != PREFOS_STATUS_OK) goto failure;
+    prefos_internal_timer_now(&phase_start);
     status = compact_q(presolver, &target->Q);
+    prefos_internal_timer_now(&phase_stop);
+    presolver->stats.quadratic_compaction_milliseconds =
+        prefos_internal_timer_elapsed_milliseconds(
+            &phase_start, &phase_stop);
     if (status != PREFOS_STATUS_OK) goto failure;
+    prefos_internal_timer_now(&phase_start);
     status = compact_general_matrix(&source->R, presolver->original_to_reduced,
                                     target->n, &target->R);
+    prefos_internal_timer_now(&phase_stop);
+    presolver->stats.factor_compaction_milliseconds =
+        prefos_internal_timer_elapsed_milliseconds(
+            &phase_start, &phase_stop);
     if (status != PREFOS_STATUS_OK) goto failure;
     status = prefos_internal_copy_vector(source->D, source->R.rows, sizeof(double),
                                       (void **) &target->D);
     if (status != PREFOS_STATUS_OK) goto failure;
+    prefos_internal_timer_now(&phase_start);
     status = build_reduced_domains(presolver);
+    prefos_internal_timer_now(&phase_stop);
+    presolver->stats.domain_compaction_milliseconds =
+        prefos_internal_timer_elapsed_milliseconds(
+            &phase_start, &phase_stop);
     if (status != PREFOS_STATUS_OK) goto failure;
     status = prefos_internal_build_reduced_affine_cones(presolver);
     if (status != PREFOS_STATUS_OK) goto failure;
@@ -1069,7 +1232,12 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
             prefos_internal_timer_elapsed_milliseconds(&start, &stop);
     }
     if (status != PREFOS_STATUS_OK) goto failure;
+    prefos_internal_timer_now(&phase_start);
     status = build_reduced_objective(presolver);
+    prefos_internal_timer_now(&phase_stop);
+    presolver->stats.objective_compaction_milliseconds =
+        prefos_internal_timer_elapsed_milliseconds(
+            &phase_start, &phase_stop);
     if (status != PREFOS_STATUS_OK) goto failure;
 
     presolver->stats.rows_reduced = target->A.rows;
@@ -1078,6 +1246,10 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     presolver->stats.nnz_Q_reduced = target->Q.nnz;
     presolver->stats.nnz_R_reduced = target->R.nnz;
     presolver->has_run = 1;
+    prefos_internal_timer_now(&phase_stop);
+    presolver->stats.presolve_total_milliseconds =
+        prefos_internal_timer_elapsed_milliseconds(
+            &presolve_start, &phase_stop);
 
     if (n_fixed_total > 0 || presolver->stats.substituted_free_variables > 0 ||
         presolver->stats.normalized_nonnegative_cones > 0 ||
@@ -1112,6 +1284,13 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     return PREFOS_STATUS_OK;
 
 failure:
+    if (shared_column_workspace_valid)
+        prefos_internal_free_column_workspace(
+            &shared_column_workspace);
+    prefos_internal_timer_now(&phase_stop);
+    presolver->stats.presolve_total_milliseconds =
+        prefos_internal_timer_elapsed_milliseconds(
+            &presolve_start, &phase_stop);
     prefos_internal_free_reduced_problem(target);
     return status;
 }

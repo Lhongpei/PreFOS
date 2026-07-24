@@ -192,9 +192,8 @@ static PreFOSStatus expand_column(const PreFOSPresolver *presolver, int column,
     if (presolver->is_substituted[column])
     {
         size_t start = presolver->substitution_term_start[column];
-        unsigned char count = presolver->substitution_term_count[column];
-        if (count == 0 || count > PREFOS_MAX_AGGREGATION_TERMS ||
-            start > presolver->n_substitution_terms ||
+        size_t count = presolver->substitution_term_count[column];
+        if (count == 0 || start > presolver->n_substitution_terms ||
             count > presolver->n_substitution_terms - start ||
             !prefos_internal_safe_add_product(
                 &row->constant, coefficient,

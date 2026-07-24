@@ -25,8 +25,8 @@ typedef struct
 
 typedef struct
 {
-    long double finite_min;
-    long double finite_max;
+    double finite_min;
+    double finite_max;
     size_t n_infinite_min;
     size_t n_infinite_max;
     size_t n_nonzeros;
@@ -49,8 +49,8 @@ typedef struct
     double upper;
     int lower_is_infinite;
     int upper_is_infinite;
-    long double finite_min_activity;
-    long double finite_max_activity;
+    double finite_min_activity;
+    double finite_max_activity;
     size_t n_infinite_min;
     size_t n_infinite_max;
 } PresolveLinearPropagationRow;
@@ -77,6 +77,10 @@ typedef struct
     const uint8_t *column_flags;
     uint8_t inactive_mask;
     const int *candidate_map;
+    const int *row_excluded_columns;
+    const uint8_t *row_exclusion_flags;
+    const int *row_exclusion_sources;
+    int row_index;
     double maximum_inferred_bound_magnitude;
     PresolveTightenScalarBound tighten_bound;
     PresolveRefreshLinearActivity refresh_activity;

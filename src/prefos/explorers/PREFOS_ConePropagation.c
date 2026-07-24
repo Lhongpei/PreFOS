@@ -24,6 +24,7 @@ static PreFOSStatus update_cone_envelope_lower(PreFOSPresolver *presolver, int c
     long double margin;
     if (candidate == -INFINITY) return PREFOS_STATUS_OK;
     if (candidate == INFINITY) return PREFOS_STATUS_PRIMAL_INFEASIBLE;
+    if (candidate <= current) return PREFOS_STATUS_OK;
     margin = prefos_internal_propagation_margin(presolver, (long double) upper);
     if (isfinite(upper) && (long double) candidate > (long double) upper + margin)
         return PREFOS_STATUS_PRIMAL_INFEASIBLE;
@@ -44,6 +45,7 @@ static PreFOSStatus update_cone_envelope_upper(PreFOSPresolver *presolver, int c
     long double margin;
     if (candidate == INFINITY) return PREFOS_STATUS_OK;
     if (candidate == -INFINITY) return PREFOS_STATUS_PRIMAL_INFEASIBLE;
+    if (candidate >= current) return PREFOS_STATUS_OK;
     margin = prefos_internal_propagation_margin(presolver, (long double) lower);
     if (isfinite(lower) && (long double) candidate < (long double) lower - margin)
         return PREFOS_STATUS_PRIMAL_INFEASIBLE;
@@ -767,6 +769,39 @@ PreFOSStatus prefos_internal_propagate_cone_block_envelopes(
     return status;
 }
 
+static int direct_cone_gpu_work_is_worthwhile(
+    const PreFOSPresolver *presolver)
+{
+    size_t active_cones = 0;
+    size_t tiny_cones = 0;
+    size_t total_dimension = 0;
+    size_t k;
+
+    for (k = 0; k < presolver->original.n_cones; ++k)
+    {
+        const PreFOSConeBlock *cone = &presolver->original.cones[k];
+        if (presolver->converted_affine_cones[k] ||
+            presolver->remove_cones[k])
+            continue;
+        ++active_cones;
+        if (cone->dimension <= 4) ++tiny_cones;
+        if (cone->dimension > SIZE_MAX - total_dimension) return 1;
+        total_dimension += cone->dimension;
+    }
+    if (active_cones == 0) return 0;
+
+    /*
+     * Thousands of three-dimensional SOC/RSOC blocks are faster as a tight
+     * host loop.  Device transfers and host candidate replay dominate their
+     * arithmetic even when the CUDA kernel itself is fully occupied.
+     */
+    if (active_cones >= 1024 &&
+        tiny_cones >= active_cones - active_cones / 4 &&
+        total_dimension / active_cones <= 8)
+        return 0;
+    return 1;
+}
+
 PreFOSStatus prefos_internal_propagate_cone_envelopes(PreFOSPresolver *presolver)
 {
     int round;
@@ -788,7 +823,8 @@ PreFOSStatus prefos_internal_propagate_cone_envelopes(PreFOSPresolver *presolver
     status = prefos_internal_materialize_affine_cone_bounds(presolver);
     if (status != PREFOS_STATUS_OK) return status;
     if (presolver->settings.linear_propagation_gpu &&
-        presolver->original.n_cones > 0)
+        presolver->original.n_cones > 0 &&
+        direct_cone_gpu_work_is_worthwhile(presolver))
     {
         PreFOSCudaPropagationStatus cuda_status;
         cuda_workspace =
@@ -865,7 +901,9 @@ PreFOSStatus prefos_internal_propagate_cone_envelopes(PreFOSPresolver *presolver
             const PreFOSConeBlock *cone = &presolver->original.cones[k];
             int needs_cpu = !cuda_round_succeeded;
             size_t local;
-            if (presolver->converted_affine_cones[k]) continue;
+            if (presolver->converted_affine_cones[k] ||
+                presolver->remove_cones[k])
+                continue;
             if (cuda_round_succeeded &&
                 (cuda_cone_flags[k] & PREFOS_CUDA_CONE_PROCESSED) != 0)
             {
@@ -1070,12 +1108,9 @@ static PreFOSStatus mark_zero_cone_collapse(PreFOSPresolver *presolver, size_t c
     for (i = 0; i < cone->dimension; ++i)
     {
         int column = cone->indices[i];
-        if (!presolver->is_fixed[column])
-        {
-            presolver->is_fixed[column] = 1;
-            presolver->fixed_values[column] = 0.0;
+        if (prefos_internal_mark_fixed_column(
+                presolver, column, 0.0))
             ++presolver->stats.fixed_cone_variables;
-        }
     }
     return PREFOS_STATUS_OK;
 }
@@ -1114,9 +1149,9 @@ static PreFOSStatus mark_rsoc_face_reduction(PreFOSPresolver *presolver, size_t 
         int column;
         if (i == survivor_position) continue;
         column = cone->indices[i];
-        presolver->is_fixed[column] = 1;
-        presolver->fixed_values[column] = 0.0;
-        ++presolver->stats.fixed_cone_variables;
+        if (prefos_internal_mark_fixed_column(
+                presolver, column, 0.0))
+            ++presolver->stats.fixed_cone_variables;
     }
     return PREFOS_STATUS_OK;
 }
@@ -1131,10 +1166,9 @@ static void expose_face_box(PreFOSPresolver *presolver, int column, double lower
 
 static void fix_face_column(PreFOSPresolver *presolver, int column)
 {
-    if (presolver->is_fixed[column]) return;
-    presolver->is_fixed[column] = 1;
-    presolver->fixed_values[column] = 0.0;
-    ++presolver->stats.fixed_cone_variables;
+    if (prefos_internal_mark_fixed_column(
+            presolver, column, 0.0))
+        ++presolver->stats.fixed_cone_variables;
 }
 
 static PreFOSStatus mark_exponential_face_reduction(PreFOSPresolver *presolver,
@@ -1304,10 +1338,9 @@ static PreFOSStatus mark_psd_face_reduction(PreFOSPresolver *presolver, size_t c
                 continue;
             packed = i * (i + 1) / 2 + j;
             column = cone->indices[packed];
-            if (presolver->is_fixed[column]) continue;
-            presolver->is_fixed[column] = 1;
-            presolver->fixed_values[column] = 0.0;
-            ++presolver->stats.fixed_cone_variables;
+            if (prefos_internal_mark_fixed_column(
+                    presolver, column, 0.0))
+                ++presolver->stats.fixed_cone_variables;
         }
     }
     return PREFOS_STATUS_OK;
@@ -1322,7 +1355,9 @@ PreFOSStatus prefos_internal_detect_zero_cone_collapses(PreFOSPresolver *presolv
         size_t i;
         int can_collapse = 1;
         PreFOSStatus transformation_status;
-        if (presolver->converted_affine_cones[k]) continue;
+        if (presolver->converted_affine_cones[k] ||
+            presolver->remove_cones[k])
+            continue;
         if (cone->type == PREFOS_CONE_NONNEGATIVE)
         {
             for (i = 0; i < cone->dimension; ++i)

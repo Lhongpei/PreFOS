@@ -20,7 +20,8 @@ static PreFOSStatus populate_gpu_singleton_candidates(
 
     workspace->gpu_singleton_candidates_valid = 0;
     workspace->n_gpu_singleton_candidates = 0;
-    if (!presolver->settings.structural_reductions_gpu)
+    if (!presolver->settings.structural_reductions_gpu ||
+        !workspace->gpu_csc_valid)
         return PREFOS_STATUS_OK;
     workspace->gpu_singleton_candidates = (int *)
         prefos_internal_alloc_array(problem->n, sizeof(int));
@@ -65,83 +66,6 @@ static PreFOSStatus populate_gpu_singleton_candidates(
     return PREFOS_STATUS_OK;
 }
 
-static int singleton_bounds_are_implied(
-    const PreFOSPresolver *presolver, size_t row, int pivot_column,
-    double pivot, double row_lower, double row_upper, int *free_below,
-    int *free_above)
-{
-    const PreFOSCsrMatrix *A = &presolver->original.A;
-    int box_position = presolver->variable_to_box[pivot_column];
-    long double rest_min = 0.0L, rest_max = 0.0L;
-    int p;
-    if (box_position < 0) return 0;
-    for (p = A->row_pointers[row]; p < A->row_pointers[row + 1]; ++p)
-    {
-        int column = A->column_indices[p];
-        double coefficient = A->values[p];
-        double lower, upper;
-        if (column == pivot_column || coefficient == 0.0 ||
-            presolver->is_fixed[column])
-            continue;
-        if (presolver->is_substituted[column] ||
-            presolver->is_parallel_removed[column])
-            return 0;
-        lower = presolver->propagation_lower[column];
-        upper = presolver->propagation_upper[column];
-        if (coefficient > 0.0)
-        {
-            rest_min += (long double) coefficient * (long double) lower;
-            rest_max += (long double) coefficient * (long double) upper;
-        }
-        else
-        {
-            rest_min += (long double) coefficient * (long double) upper;
-            rest_max += (long double) coefficient * (long double) lower;
-        }
-        if (!isfinite(rest_min) || !isfinite(rest_max)) return 0;
-    }
-    {
-        long double x1, x2, implied_lower, implied_upper;
-        double lower = presolver->working_box_lower[box_position];
-        double upper = presolver->working_box_upper[box_position];
-        double tolerance = presolver->settings.feasibility_tolerance;
-        if (isfinite(row_lower) && isfinite(row_upper) &&
-            fabs(row_upper - row_lower) <= tolerance)
-        {
-            x1 = ((long double) row_upper - rest_min) / (long double) pivot;
-            x2 = ((long double) row_upper - rest_max) / (long double) pivot;
-            implied_lower = fminl(x1, x2);
-            implied_upper = fmaxl(x1, x2);
-        }
-        else
-        {
-            implied_lower = -INFINITY;
-            implied_upper = INFINITY;
-            if (pivot > 0.0)
-            {
-                if (isfinite(row_lower))
-                    implied_lower =
-                        ((long double) row_lower - rest_max) / pivot;
-                if (isfinite(row_upper))
-                    implied_upper =
-                        ((long double) row_upper - rest_min) / pivot;
-            }
-            else
-            {
-                if (isfinite(row_upper))
-                    implied_lower =
-                        ((long double) row_upper - rest_min) / pivot;
-                if (isfinite(row_lower))
-                    implied_upper =
-                        ((long double) row_lower - rest_max) / pivot;
-            }
-        }
-        *free_below = !isfinite(lower) || implied_lower >= lower - tolerance;
-        *free_above = !isfinite(upper) || implied_upper <= upper + tolerance;
-    }
-    return 1;
-}
-
 static PreFOSStatus append_equality_relaxed_record(
     PreFOSPresolver *presolver, int row, double side, double normal_sign)
 {
@@ -167,68 +91,248 @@ PreFOSStatus prefos_internal_reduce_singleton_columns(
     int allow_one_sided)
 {
     const PreFOSProblemData *problem = &presolver->original;
-    size_t candidate, candidate_count;
-    PreFOSStatus candidate_status;
+    int *targets = NULL;
+    double *scales = NULL;
+    int *live_degrees = NULL;
+    int *queue = NULL;
+    unsigned char *queued = NULL;
+    size_t queue_position = 0, queue_count = 0;
+    size_t row_capacity = 0, row_index, column;
+    PreFOSStatus status;
     if (!presolver->settings.singleton_column_reduction)
         return PREFOS_STATUS_OK;
-    candidate_status =
-        populate_gpu_singleton_candidates(presolver, workspace);
-    if (candidate_status != PREFOS_STATUS_OK) return candidate_status;
-    candidate_count = workspace->gpu_singleton_candidates_valid
-                          ? workspace->n_gpu_singleton_candidates
-                          : problem->n;
-    for (candidate = 0; candidate < candidate_count; ++candidate)
+    status = populate_gpu_singleton_candidates(presolver, workspace);
+    if (status != PREFOS_STATUS_OK) return status;
+    live_degrees =
+        (int *) prefos_internal_alloc_array(problem->n, sizeof(int));
+    queue = (int *) prefos_internal_alloc_array(problem->n, sizeof(int));
+    queued = (unsigned char *) calloc(problem->n, sizeof(unsigned char));
+    if (problem->n > 0 && (!live_degrees || !queue || !queued))
     {
-        size_t column = workspace->gpu_singleton_candidates_valid
-                            ? (size_t)
-                                  workspace->gpu_singleton_candidates[candidate]
-                            : candidate;
+        free(live_degrees);
+        free(queue);
+        free(queued);
+        return PREFOS_STATUS_OUT_OF_MEMORY;
+    }
+    for (column = 0; column < problem->n; ++column)
+    {
+        int degree = workspace->gpu_stats_valid
+                         ? workspace->gpu_degrees[column]
+                         : workspace->live_degrees[column];
+        live_degrees[column] = degree;
+        if (degree == 1 &&
+            prefos_internal_column_is_linear_box(
+                presolver, workspace, (int) column) &&
+            !workspace->protected_target[column] &&
+            presolver->substitution_incoming_depth[column] <
+                PREFOS_MAX_SUBSTITUTION_DEPTH)
+        {
+            queue[queue_count++] = (int) column;
+            queued[column] = 1;
+        }
+    }
+    if (queue_count == 0)
+    {
+        status = PREFOS_STATUS_OK;
+        goto cleanup;
+    }
+    row_capacity = workspace->max_row_nnz;
+    if (row_capacity == 0)
+    {
+        for (row_index = 0; row_index < problem->A.rows; ++row_index)
+        {
+            size_t length = (size_t)
+                (problem->A.row_pointers[row_index + 1] -
+                 problem->A.row_pointers[row_index]);
+            if (length > row_capacity) row_capacity = length;
+        }
+    }
+    targets = (int *) prefos_internal_alloc_array(row_capacity, sizeof(int));
+    scales = (double *)
+        prefos_internal_alloc_array(row_capacity, sizeof(double));
+    if (row_capacity > 0 && (!targets || !scales))
+    {
+        status = PREFOS_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+    while (queue_position < queue_count)
+    {
+        column = (size_t) queue[queue_position++];
         int row, p, free_below = 0, free_above = 0;
-        int targets[PREFOS_MAX_AGGREGATION_TERMS];
-        double scales[PREFOS_MAX_AGGREGATION_TERMS];
+        int row_was_removed;
+        double fixed_shift = 0.0;
         double pivot = 0.0, lower, upper, side;
+        long double rest_min = 0.0L, rest_max = 0.0L;
+        int finite_rest_min = 1, finite_rest_max = 1;
         int equality;
         PreFOSSubstitutionMode substitution_mode = PREFOS_SUBSTITUTION_STANDARD;
         size_t target_count = 0;
         if (!prefos_internal_column_is_linear_box(
                 presolver, workspace, (int) column) ||
             workspace->protected_target[column] ||
-            workspace->starts[column + 1] - workspace->starts[column] != 1)
+            presolver->substitution_incoming_depth[column] >=
+                PREFOS_MAX_SUBSTITUTION_DEPTH ||
+            live_degrees[column] != 1)
             continue;
-        row = workspace->rows[workspace->starts[column]];
-        if (presolver->remove_rows[row] || workspace->dirty_row[row]) continue;
-        if (prefos_internal_effective_row_bounds(
-                presolver, (size_t) row, &lower, &upper) != PREFOS_STATUS_OK)
-            return PREFOS_STATUS_NUMERICAL_ERROR;
+        row = -1;
+        for (p = workspace->starts[column];
+             p < workspace->ends[column]; ++p)
+        {
+            int candidate_row = workspace->rows[p];
+            if (!presolver->remove_rows[candidate_row])
+            {
+                row = candidate_row;
+                break;
+            }
+        }
+        if (row < 0 || workspace->dirty_row[row]) continue;
         for (p = problem->A.row_pointers[row];
              p < problem->A.row_pointers[row + 1]; ++p)
         {
             int target = problem->A.column_indices[p];
             double coefficient = problem->A.values[p];
-            if (coefficient == 0.0 || presolver->is_fixed[target]) continue;
+            double target_lower, target_upper;
+            if (coefficient == 0.0) continue;
             if (target == (int) column)
             {
                 pivot = coefficient;
                 continue;
             }
-            if (presolver->is_substituted[target] ||
-                presolver->is_parallel_removed[target] ||
-                target_count >= PREFOS_MAX_AGGREGATION_TERMS)
+            if (presolver->is_fixed[target])
             {
-                target_count = PREFOS_MAX_AGGREGATION_TERMS + 1;
+                if (!prefos_internal_safe_add_product(
+                        &fixed_shift, coefficient,
+                        presolver->fixed_values[target]))
+                {
+                    status = PREFOS_STATUS_NUMERICAL_ERROR;
+                    goto cleanup;
+                }
+                continue;
+            }
+            if (presolver->is_substituted[target])
+            {
+                if (!prefos_internal_term_is_active_in_row(
+                        presolver, (size_t) row, target))
+                    continue;
+                target_count = row_capacity + 1;
+                break;
+            }
+            if (presolver->is_parallel_removed[target])
+            {
+                target_count = row_capacity + 1;
+                break;
+            }
+            if (target_count >= row_capacity)
+            {
+                target_count = row_capacity + 1;
                 break;
             }
             targets[target_count] = target;
             scales[target_count] = coefficient;
             ++target_count;
+            target_lower = presolver->propagation_lower[target];
+            target_upper = presolver->propagation_upper[target];
+            if (coefficient > 0.0)
+            {
+                if (finite_rest_min)
+                {
+                    long double term =
+                        (long double) coefficient * target_lower;
+                    if (isfinite(term) &&
+                        isfinite(rest_min + term))
+                        rest_min += term;
+                    else
+                        finite_rest_min = 0;
+                }
+                if (finite_rest_max)
+                {
+                    long double term =
+                        (long double) coefficient * target_upper;
+                    if (isfinite(term) &&
+                        isfinite(rest_max + term))
+                        rest_max += term;
+                    else
+                        finite_rest_max = 0;
+                }
+            }
+            else
+            {
+                if (finite_rest_min)
+                {
+                    long double term =
+                        (long double) coefficient * target_upper;
+                    if (isfinite(term) &&
+                        isfinite(rest_min + term))
+                        rest_min += term;
+                    else
+                        finite_rest_min = 0;
+                }
+                if (finite_rest_max)
+                {
+                    long double term =
+                        (long double) coefficient * target_lower;
+                    if (isfinite(term) &&
+                        isfinite(rest_max + term))
+                        rest_max += term;
+                    else
+                        finite_rest_max = 0;
+                }
+            }
+        }
+        lower = presolver->working_constraint_lower[row] -
+                fixed_shift;
+        upper = presolver->working_constraint_upper[row] -
+                fixed_shift;
+        if (isnan(lower) || isnan(upper))
+        {
+            status = PREFOS_STATUS_NUMERICAL_ERROR;
+            goto cleanup;
         }
         if (pivot == 0.0 || target_count == 0 ||
-            target_count >
-                (size_t) presolver->settings.max_aggregation_terms ||
-            !singleton_bounds_are_implied(presolver, (size_t) row, (int) column,
-                                          pivot, lower, upper, &free_below,
-                                          &free_above))
+            target_count > row_capacity)
             continue;
+        {
+            int box_position =
+                presolver->variable_to_box[column];
+            long double implied_lower = -INFINITY;
+            long double implied_upper = INFINITY;
+            double box_lower, box_upper;
+            double tolerance =
+                presolver->settings.feasibility_tolerance;
+            if (box_position < 0) continue;
+            box_lower =
+                presolver->working_box_lower[box_position];
+            box_upper =
+                presolver->working_box_upper[box_position];
+            if (pivot > 0.0)
+            {
+                if (isfinite(lower) && finite_rest_max)
+                    implied_lower =
+                        ((long double) lower - rest_max) / pivot;
+                if (isfinite(upper) && finite_rest_min)
+                    implied_upper =
+                        ((long double) upper - rest_min) / pivot;
+            }
+            else
+            {
+                if (isfinite(upper) && finite_rest_min)
+                    implied_lower =
+                        ((long double) upper - rest_min) / pivot;
+                if (isfinite(lower) && finite_rest_max)
+                    implied_upper =
+                        ((long double) lower - rest_max) / pivot;
+            }
+            free_below =
+                !isfinite(box_lower) ||
+                (isfinite(implied_lower) &&
+                 implied_lower >=
+                     (long double) box_lower - tolerance);
+            free_above =
+                !isfinite(box_upper) ||
+                (isfinite(implied_upper) &&
+                 implied_upper <=
+                     (long double) box_upper + tolerance);
+        }
         equality = isfinite(lower) && isfinite(upper) &&
                    fabs(lower - upper) <=
                        presolver->settings.feasibility_tolerance;
@@ -250,19 +354,18 @@ PreFOSStatus prefos_internal_reduce_singleton_columns(
                      (objective < -presolver->settings.feasibility_tolerance &&
                       pivot < 0.0 && free_above)) &&
                     isfinite(lower);
-                PreFOSStatus status;
                 if (tighten_lower)
                 {
                     status = append_equality_relaxed_record(
                         presolver, row, upper, 1.0);
-                    if (status != PREFOS_STATUS_OK) return status;
+                    if (status != PREFOS_STATUS_OK) goto cleanup;
                     presolver->working_constraint_lower[row] = upper;
                 }
                 else if (tighten_upper)
                 {
                     status = append_equality_relaxed_record(
                         presolver, row, lower, -1.0);
-                    if (status != PREFOS_STATUS_OK) return status;
+                    if (status != PREFOS_STATUS_OK) goto cleanup;
                     presolver->working_constraint_upper[row] = lower;
                 }
                 else
@@ -303,18 +406,42 @@ PreFOSStatus prefos_internal_reduce_singleton_columns(
         else
             side = isfinite(lower) ? lower : upper;
         if (!isfinite(side)) continue;
-        for (p = 0; p < (int) target_count; ++p)
+        for (row_index = 0; row_index < target_count; ++row_index)
+            scales[row_index] = -scales[row_index] / pivot;
+        row_was_removed = presolver->remove_rows[row];
+        status = prefos_internal_append_column_substitution(
+            presolver, (int) column, targets, scales, target_count, row,
+            side / pivot, pivot, workspace, substitution_mode);
+        if (status != PREFOS_STATUS_OK) goto cleanup;
+        workspace->dirty_row[row] =
+            (unsigned char)
+                (substitution_mode !=
+                 PREFOS_SUBSTITUTION_RESIDUAL_ROW);
+        if (!row_was_removed && presolver->remove_rows[row])
         {
-            scales[p] = -scales[p] / pivot;
-            workspace->protected_target[targets[p]] = 1;
+            for (p = problem->A.row_pointers[row];
+                 p < problem->A.row_pointers[row + 1]; ++p)
+            {
+                int adjacent_column = problem->A.column_indices[p];
+                if (problem->A.values[p] == 0.0 ||
+                    live_degrees[adjacent_column] <= 0)
+                    continue;
+                --live_degrees[adjacent_column];
+                if (live_degrees[adjacent_column] == 1 &&
+                    !queued[adjacent_column])
+                {
+                    queue[queue_count++] = adjacent_column;
+                    queued[adjacent_column] = 1;
+                }
+            }
         }
-        {
-            PreFOSStatus status = prefos_internal_append_column_substitution(
-                presolver, (int) column, targets, scales, target_count, row,
-                side / pivot, pivot, workspace, substitution_mode);
-            if (status != PREFOS_STATUS_OK) return status;
-        }
-        workspace->dirty_row[row] = 1;
     }
-    return PREFOS_STATUS_OK;
+    status = PREFOS_STATUS_OK;
+cleanup:
+    free(targets);
+    free(scales);
+    free(live_degrees);
+    free(queue);
+    free(queued);
+    return status;
 }

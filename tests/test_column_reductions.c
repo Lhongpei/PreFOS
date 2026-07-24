@@ -109,7 +109,7 @@ static int test_quadratic_empty_column_is_protected(void)
     return 0;
 }
 
-static int test_dual_fixing_and_gpu_fallback(void)
+static int test_dual_fixing_with_structural_gpu_enabled(void)
 {
     double A_values[] = {1.0};
     int A_columns[] = {0};
@@ -126,9 +126,8 @@ static int test_dual_fixing_and_gpu_fallback(void)
     PreFOSSettings settings = prefos_strict_settings();
     PreFOSPresolver *presolver = NULL;
     const PreFOSStats *stats;
-    double original_x[1];
-    int gpu_available = prefos_gpu_warmup();
-
+    double original_x[1], original_y[1], original_z[1];
+    PreFOSPostsolveKKTVerification verification;
     settings.structural_reductions_gpu = 1;
     init_linear_problem(&problem, 1, 1, 1, A_values, A_columns, A_rows,
                         row_lower, row_upper, Q_rows, R_rows, c, box_indices,
@@ -138,12 +137,29 @@ static int test_dual_fixing_and_gpu_fallback(void)
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
     stats = prefos_get_stats(presolver);
     CHECK(stats->dual_fixed_columns == 1);
-    CHECK(stats->structural_gpu_passes == (size_t) gpu_available);
-    CHECK(stats->structural_gpu_fallbacks == (size_t) !gpu_available);
+    CHECK(stats->structural_gpu_fallbacks == 0);
     CHECK(prefos_postsolve_primal(presolver, NULL, original_x) == PREFOS_STATUS_OK);
     CHECK(close_to(original_x[0], 0.0));
     prefos_free_presolver(presolver);
 
+    c[0] = 0.0;
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
+    CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
+    CHECK(prefos_get_stats(presolver)->dual_fixed_columns == 1);
+    CHECK(prefos_postsolve_primal_dual(
+              presolver, NULL, NULL, NULL, 1e-10,
+              original_x, original_y, original_z) == PREFOS_STATUS_OK);
+    CHECK(close_to(original_x[0], 0.0));
+    CHECK(close_to(original_y[0], 0.0));
+    CHECK(close_to(original_z[0], 0.0));
+    CHECK(prefos_verify_postsolve_kkt(
+              presolver, NULL, NULL, NULL, 1e-10,
+              &verification) == PREFOS_STATUS_OK);
+    CHECK(verification.passed);
+    prefos_free_presolver(presolver);
+
+    c[0] = 1.0;
     box_lower[0] = -INFINITY;
     CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
           PREFOS_STATUS_OK);
@@ -165,7 +181,6 @@ static int test_singleton_column_substitution(void)
     int box_indices[] = {0, 1};
     double box_lower[] = {-INFINITY, 0.0};
     double box_upper[] = {INFINITY, 2.0};
-    double reduced_x[] = {2.0};
     double original_x[2];
     PreFOSProblemData problem;
     PreFOSSettings settings = prefos_strict_settings();
@@ -173,8 +188,6 @@ static int test_singleton_column_substitution(void)
     const PreFOSPresolvedProblem *reduced;
     const PreFOSStats *stats;
     PreFOSPrimalVerification verification;
-    int gpu_available = prefos_gpu_warmup();
-
     settings.structural_reductions_gpu = 1;
     init_linear_problem(&problem, 2, 1, 2, A_values, A_columns, A_rows,
                         row_side, row_side, Q_rows, R_rows, c, box_indices,
@@ -184,20 +197,18 @@ static int test_singleton_column_substitution(void)
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
     reduced = prefos_get_reduced_problem(presolver);
     stats = prefos_get_stats(presolver);
-    CHECK(reduced->n == 1 && reduced->A.rows == 0);
-    CHECK(close_to(reduced->objective_offset, 2.0));
-    CHECK(close_to(reduced->c[0], -1.0));
+    CHECK(reduced->n == 0 && reduced->A.rows == 0);
+    CHECK(close_to(reduced->objective_offset, 0.0));
     CHECK(stats->removed_singleton_columns == 1);
-    CHECK(gpu_available ? stats->column_csc_gpu_builds > 0
-                        : stats->column_csc_gpu_fallbacks > 0);
-    CHECK(gpu_available ? stats->singleton_column_gpu_passes > 0
-                        : stats->singleton_column_gpu_fallbacks > 0);
-    if (gpu_available)
-        CHECK(stats->singleton_column_gpu_candidates > 0);
-    CHECK(prefos_postsolve_primal(presolver, reduced_x, original_x) ==
+    CHECK(stats->removed_empty_columns == 1);
+    CHECK(stats->column_csc_gpu_builds == 0);
+    CHECK(stats->column_csc_gpu_fallbacks == 0);
+    CHECK(stats->singleton_column_gpu_passes == 0);
+    CHECK(stats->singleton_column_gpu_fallbacks == 0);
+    CHECK(prefos_postsolve_primal(presolver, NULL, original_x) ==
           PREFOS_STATUS_OK);
     CHECK(close_to(original_x[0], 0.0) && close_to(original_x[1], 2.0));
-    CHECK(prefos_verify_postsolve_primal(presolver, reduced_x, 1e-10,
+    CHECK(prefos_verify_postsolve_primal(presolver, NULL, 1e-10,
                                          &verification) == PREFOS_STATUS_OK);
     CHECK(verification.passed);
     prefos_free_presolver(presolver);
@@ -270,33 +281,31 @@ static int test_one_sided_singleton_reductions(void)
         double box_lower[] = {0.0, 0.0};
         double box_upper[] = {10.0, 1.0};
         PreFOSProblemData problem;
+        PreFOSSettings settings = prefos_default_settings();
         PreFOSPresolver *presolver = NULL;
         const PreFOSPresolvedProblem *reduced;
-        double reduced_x[] = {3.0, 1.0};
-        double reduced_y[] = {-1.0};
-        double reduced_z[] = {0.0, 1.0};
         double original_x[2], original_y[1], original_z[2];
         PreFOSPostsolveKKTVerification verification;
 
         init_linear_problem(&problem, 2, 1, 2, A_values, A_columns, A_rows,
                             row_lower, row_upper, Q_rows, R_rows, c, box_indices,
                             box_lower, box_upper);
-        CHECK(prefos_create_presolver(&problem, NULL, &presolver) ==
+        settings.dual_fixing = 0;
+        CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
               PREFOS_STATUS_OK);
         CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
         reduced = prefos_get_reduced_problem(presolver);
-        CHECK(reduced->A.rows == 1);
-        CHECK(close_to(reduced->constraint_lower[0], 4.0));
-        CHECK(close_to(reduced->constraint_upper[0], 4.0));
+        CHECK(reduced->n == 0 && reduced->A.rows == 0);
+        CHECK(close_to(reduced->objective_offset, 3.0));
         CHECK(prefos_get_stats(presolver)->tightened_singleton_rows == 1);
         CHECK(prefos_postsolve_primal_dual(
-                  presolver, reduced_x, reduced_y, reduced_z, 1e-10,
+                  presolver, NULL, NULL, NULL, 1e-10,
                   original_x, original_y, original_z) == PREFOS_STATUS_OK);
         CHECK(close_to(original_y[0], -1.0));
         CHECK(close_to(original_z[0], 0.0));
         CHECK(close_to(original_z[1], 1.0));
         CHECK(prefos_verify_postsolve_kkt(
-                  presolver, reduced_x, reduced_y, reduced_z, 1e-10,
+                  presolver, NULL, NULL, NULL, 1e-10,
                   &verification) == PREFOS_STATUS_OK);
         CHECK(verification.passed);
         prefos_free_presolver(presolver);
@@ -313,9 +322,6 @@ static int test_one_sided_singleton_reductions(void)
         int box_indices[] = {0, 1};
         double box_lower[] = {0.0, 0.0};
         double box_upper[] = {10.0, 1.0};
-        double reduced_x[] = {4.0, 0.0};
-        double reduced_y[] = {1.0};
-        double reduced_z[] = {0.0, -1.0};
         double original_x[2], original_y[1], original_z[2];
         PreFOSProblemData problem;
         PreFOSPresolver *presolver = NULL;
@@ -327,20 +333,18 @@ static int test_one_sided_singleton_reductions(void)
         CHECK(prefos_create_presolver(&problem, NULL, &presolver) ==
               PREFOS_STATUS_OK);
         CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
-        CHECK(close_to(prefos_get_reduced_problem(presolver)
-                           ->constraint_lower[0],
-                       4.0));
-        CHECK(close_to(prefos_get_reduced_problem(presolver)
-                           ->constraint_upper[0],
-                       4.0));
+        CHECK(prefos_get_reduced_problem(presolver)->n == 0);
+        CHECK(prefos_get_reduced_problem(presolver)->A.rows == 0);
+        CHECK(close_to(prefos_get_reduced_problem(presolver)->objective_offset,
+                       -4.0));
         CHECK(prefos_postsolve_primal_dual(
-                  presolver, reduced_x, reduced_y, reduced_z, 1e-10,
+                  presolver, NULL, NULL, NULL, 1e-10,
                   original_x, original_y, original_z) == PREFOS_STATUS_OK);
         CHECK(close_to(original_y[0], 1.0));
         CHECK(close_to(original_z[0], 0.0));
         CHECK(close_to(original_z[1], -1.0));
         CHECK(prefos_verify_postsolve_kkt(
-                  presolver, reduced_x, reduced_y, reduced_z, 1e-10,
+                  presolver, NULL, NULL, NULL, 1e-10,
                   &verification) == PREFOS_STATUS_OK);
         CHECK(verification.passed);
         prefos_free_presolver(presolver);
@@ -366,6 +370,7 @@ static int test_one_sided_singleton_reductions(void)
         PreFOSPostsolveKKTVerification verification;
 
         settings.linear_propagation = 0;
+        settings.bounded_doubleton_substitution = 0;
         init_linear_problem(&problem, 2, 1, 2, A_values, A_columns, A_rows,
                             row_side, row_side, Q_rows, R_rows, c, box_indices,
                             box_lower, box_upper);
@@ -417,6 +422,7 @@ static int test_bounded_doubleton_substitution(void)
 
     settings.singleton_column_reduction = 0;
     settings.bounded_doubleton_substitution = 1;
+    settings.remove_empty_columns = 0;
     init_linear_problem(&problem, 2, 1, 2, A_values, A_columns, A_rows,
                         row_side, row_side, Q_rows, R_rows, c, box_indices,
                         box_lower, box_upper);
@@ -466,6 +472,7 @@ static int test_bounded_doubleton_substitution(void)
 
         positive_settings.singleton_column_reduction = 0;
         positive_settings.bounded_doubleton_substitution = 1;
+        positive_settings.remove_empty_columns = 0;
         init_linear_problem(
             &positive_problem, 2, 1, 2, positive_A_values,
             positive_A_columns, positive_A_rows, positive_side, positive_side,
@@ -510,6 +517,7 @@ static int test_bounded_doubleton_substitution(void)
 
         target_settings.singleton_column_reduction = 0;
         target_settings.bounded_doubleton_substitution = 1;
+        target_settings.remove_empty_columns = 0;
         init_linear_problem(
             &target_problem, 2, 1, 2, target_A_values, target_A_columns,
             target_A_rows, target_side, target_side, target_Q_rows,
@@ -535,11 +543,47 @@ static int test_bounded_doubleton_substitution(void)
     return 0;
 }
 
+static int test_bounded_doubleton_skips_dirty_rows(void)
+{
+    double A_values[] = {1.0, 1.0, -1.0, 1.0, 1.0};
+    int A_columns[] = {0, 1, 0, 2, 3};
+    int A_rows[] = {0, 2, 5};
+    double row_side[] = {1.0, -1.0};
+    int Q_rows[] = {0, 0, 0, 0, 0};
+    int R_rows[] = {0};
+    double c[] = {0.0, 0.0, 0.0, 0.0};
+    int box_indices[] = {0, 1, 2, 3};
+    double box_lower[] = {0.0, 0.0, 0.0, 0.0};
+    double box_upper[] = {INFINITY, INFINITY, INFINITY, INFINITY};
+    PreFOSProblemData problem;
+    PreFOSSettings settings = prefos_strict_settings();
+    PreFOSPresolver *presolver = NULL;
+    PreFOSStatus status;
+
+    settings.singleton_column_reduction = 0;
+    settings.bounded_doubleton_substitution = 1;
+    settings.linear_propagation = 0;
+    settings.remove_redundant_rows = 0;
+    settings.parallel_column_reduction = 0;
+    settings.dual_fixing = 0;
+    init_linear_problem(&problem, 4, 2, 5, A_values, A_columns, A_rows,
+                        row_side, row_side, Q_rows, R_rows, c, box_indices,
+                        box_lower, box_upper);
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
+    status = prefos_run_presolve(presolver);
+    CHECK(status == PREFOS_STATUS_REDUCED || status == PREFOS_STATUS_OK);
+    CHECK(prefos_get_stats(presolver)->substituted_bounded_doubletons == 1);
+    prefos_free_presolver(presolver);
+    return 0;
+}
+
 static PreFOSSettings parallel_only_settings(void)
 {
     PreFOSSettings settings = prefos_strict_settings();
     settings.remove_redundant_rows = 0;
     settings.free_column_substitution = 0;
+    settings.remove_empty_columns = 0;
     settings.singleton_column_reduction = 0;
     settings.bounded_doubleton_substitution = 0;
     settings.linear_propagation = 0;
@@ -549,7 +593,6 @@ static PreFOSSettings parallel_only_settings(void)
 
 static int test_parallel_column_reductions(void)
 {
-    int gpu_available = prefos_gpu_warmup();
     {
         double A_values[] = {1, -1, 1, 1, 1, 2, 2, -1};
         int A_columns[] = {0, 1, 1, 2, 3, 1, 2, 3};
@@ -618,10 +661,8 @@ static int test_parallel_column_reductions(void)
         reduced = prefos_get_reduced_problem(presolver);
         CHECK(reduced->n == 2 && reduced->A.nnz == 4);
         CHECK(prefos_get_stats(presolver)->merged_parallel_columns == 2);
-        CHECK(gpu_available
-                  ? prefos_get_stats(presolver)->parallel_column_gpu_passes > 0
-                  : prefos_get_stats(presolver)
-                            ->parallel_column_gpu_fallbacks > 0);
+        CHECK(prefos_get_stats(presolver)->parallel_column_gpu_passes == 0);
+        CHECK(prefos_get_stats(presolver)->parallel_column_gpu_fallbacks == 0);
         CHECK(close_to(reduced->box_lower[0], -3.0));
         CHECK(close_to(reduced->box_upper[0], 3.0));
         CHECK(prefos_postsolve_primal(presolver, reduced_x, original_x) ==
@@ -711,6 +752,7 @@ static int test_redundant_sides_and_bounds(void)
 
         settings.linear_propagation = 0;
         settings.parallel_column_reduction = 0;
+        settings.dual_fixing = 0;
         init_linear_problem(&problem, 2, 1, 2, A_values, A_columns, A_rows,
                             row_lower, row_upper, Q_rows, R_rows, c, box_indices,
                             box_lower, box_upper);
@@ -745,6 +787,7 @@ static int test_redundant_sides_and_bounds(void)
             PREFOS_PROPAGATED_BOUND_POLICY_INTERIOR_POINT;
         settings.singleton_column_reduction = 0;
         settings.parallel_column_reduction = 0;
+        settings.dual_fixing = 0;
         init_linear_problem(&problem, 2, 1, 2, A_values, A_columns, A_rows,
                             row_lower, row_upper, Q_rows, R_rows, c, box_indices,
                             box_lower, box_upper);
@@ -772,10 +815,11 @@ int main(void)
 {
     if (test_empty_columns()) return 1;
     if (test_quadratic_empty_column_is_protected()) return 1;
-    if (test_dual_fixing_and_gpu_fallback()) return 1;
+    if (test_dual_fixing_with_structural_gpu_enabled()) return 1;
     if (test_singleton_column_substitution()) return 1;
     if (test_one_sided_singleton_reductions()) return 1;
     if (test_bounded_doubleton_substitution()) return 1;
+    if (test_bounded_doubleton_skips_dirty_rows()) return 1;
     if (test_parallel_column_reductions()) return 1;
     if (test_redundant_sides_and_bounds()) return 1;
     printf("All PreFOS column reduction tests passed!\n");

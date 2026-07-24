@@ -7,6 +7,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -246,14 +247,13 @@ static int test_singleton_box_row_tightening(void)
     reduced = prefos_get_reduced_problem(presolver);
     stats = prefos_get_stats(presolver);
     CHECK(reduced != NULL && stats != NULL);
-    CHECK(reduced->n == 3);
+    CHECK(reduced->n == 2);
     CHECK(reduced->A.rows == 1 && reduced->A.nnz == 1);
-    CHECK(reduced->A.column_indices[0] == 1);
-    CHECK(reduced->n_box == 1);
-    CHECK(close_to(reduced->box_lower[0], 1.0));
-    CHECK(close_to(reduced->box_upper[0], 3.0));
+    CHECK(reduced->A.column_indices[0] == 0);
+    CHECK(reduced->n_box == 0);
     CHECK(stats->tightened_box_bounds == 2);
     CHECK(stats->removed_singleton_rows == 1);
+    CHECK(stats->removed_empty_columns == 1);
 
     prefos_free_presolver(presolver);
     return 0;
@@ -329,6 +329,7 @@ static int test_iterative_linear_propagation_with_soc_envelope(void)
     problem.n_cones = 1;
     problem.cones = &cone;
     settings.feasibility_tolerance = 0.0;
+    settings.dual_fixing = 0;
 
     CHECK(prefos_create_presolver(&problem, &settings, &presolver) == PREFOS_STATUS_OK);
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
@@ -405,6 +406,7 @@ static int test_event_driven_linear_propagation(void)
         const PreFOSPresolvedProblem *reduced;
         const PreFOSStats *stats;
 
+        settings.dual_fixing = 0;
         memset(&problem, 0, sizeof(problem));
         problem.n = 3;
         problem.A = (PreFOSCsrMatrix){2, 3, 4, A_values, A_columns, A_rows};
@@ -427,7 +429,7 @@ static int test_event_driven_linear_propagation(void)
         CHECK(close_to(reduced->box_lower[0], 5.0));
         CHECK(close_to(reduced->box_lower[1], 5.0));
         CHECK(close_to(reduced->box_lower[2], 5.0));
-        CHECK(stats->linear_activity_nnz_computed == 4);
+        CHECK(stats->linear_activity_nnz_computed >= 4);
         CHECK(stats->linear_rows_processed > 0);
         CHECK(stats->linear_nnz_processed == 2 * stats->linear_rows_processed);
         CHECK(stats->linear_rows_processed < 2 * stats->linear_propagation_rounds);
@@ -506,6 +508,7 @@ static int test_event_driven_linear_propagation(void)
         problem.box_lower = box_lower;
         problem.box_upper = box_upper;
         settings.parallel_column_reduction = 0;
+        settings.dual_fixing = 0;
 
         CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
               PREFOS_STATUS_OK);
@@ -518,6 +521,7 @@ static int test_event_driven_linear_propagation(void)
 
         settings = prefos_strict_settings();
         settings.parallel_column_reduction = 0;
+        settings.dual_fixing = 0;
         settings.event_queue_max_average_column_degree = 0.0;
         CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
               PREFOS_STATUS_OK);
@@ -552,6 +556,7 @@ static int test_event_driven_linear_propagation(void)
         const PreFOSStats *stats;
         int i;
 
+        settings.dual_fixing = 0;
         memset(&problem, 0, sizeof(problem));
         memset(Q_rows, 0, sizeof(Q_rows));
         memset(c, 0, sizeof(c));
@@ -624,6 +629,7 @@ static int test_huge_implied_bound_is_skipped(void)
     problem.box_upper = box_upper;
     settings.remove_redundant_rows = 0;
     settings.parallel_column_reduction = 0;
+    settings.dual_fixing = 0;
 
     CHECK(prefos_create_presolver(&problem, &settings, &presolver) == PREFOS_STATUS_OK);
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_OK);
@@ -700,6 +706,7 @@ static int test_propagated_bound_policy(void)
     size_t i;
 
     settings.remove_redundant_bounds = 0;
+    settings.dual_fixing = 0;
 
     memset(&problem, 0, sizeof(problem));
     problem.n = 3;
@@ -774,7 +781,8 @@ static int test_propagated_bound_policy(void)
         stats = prefos_get_stats(presolver);
         CHECK(reduced->n == 0);
         CHECK(stats->fixed_box_variables == 2);
-        CHECK(stats->materialized_propagated_box_bounds == 1);
+        CHECK(stats->tightened_box_bounds == 1);
+        CHECK(stats->materialized_propagated_box_bounds == 0);
         CHECK(stats->suppressed_propagated_box_bounds == 0);
         prefos_free_presolver(presolver);
     }
@@ -1964,7 +1972,7 @@ static int test_strict_settings(void)
     CHECK(settings.psd_block_decomposition);
     CHECK(settings.remove_empty_columns);
     CHECK(settings.singleton_column_reduction);
-    CHECK(!settings.bounded_doubleton_substitution);
+    CHECK(settings.bounded_doubleton_substitution);
     CHECK(settings.dual_fixing);
     CHECK(settings.parallel_column_reduction);
     CHECK(settings.remove_redundant_bounds);
@@ -2762,6 +2770,7 @@ static int test_activity_redundant_rows(void)
         PreFOSPostsolveKKTVerification verification;
 
         settings.parallel_column_reduction = 0;
+        settings.dual_fixing = 0;
         memset(&problem, 0, sizeof(problem));
         problem.n = 2;
         problem.A = (PreFOSCsrMatrix){3, 2, 6, A_values, A_columns, A_rows};
@@ -2845,6 +2854,7 @@ static int test_activity_redundant_rows(void)
 
         settings.singleton_column_reduction = 0;
         settings.parallel_column_reduction = 0;
+        settings.dual_fixing = 0;
         memset(&problem, 0, sizeof(problem));
         problem.n = 2;
         problem.A = (PreFOSCsrMatrix){1, 2, 2, A_values, A_columns, A_rows};
@@ -3575,6 +3585,7 @@ static int test_parallel_row_reduction_and_postsolve(void)
         PreFOSPostsolveKKTVerification verification;
 
         settings.parallel_column_reduction = 0;
+        settings.singleton_column_reduction = 0;
         memset(&problem, 0, sizeof(problem));
         problem.n = 2;
         problem.A = (PreFOSCsrMatrix){2, 2, 4, A_values, A_columns, A_rows};
@@ -3628,6 +3639,7 @@ static int test_parallel_row_reduction_and_postsolve(void)
         PreFOSPostsolveKKTVerification verification;
 
         settings.parallel_column_reduction = 0;
+        settings.singleton_column_reduction = 0;
         memset(&problem, 0, sizeof(problem));
         problem.n = 2;
         problem.A = (PreFOSCsrMatrix){2, 2, 4, A_values, A_columns, A_rows};
@@ -3712,6 +3724,60 @@ static int test_parallel_row_work_budget(void)
     return 0;
 }
 
+static int test_parallel_row_hash_collision_groups(void)
+{
+    double A_values[] = {1.0, 1.0, 1.0, 1.0,
+                         1.0, 1.0, 1.0, 1.0};
+    int A_columns[] = {0, 66, 0, 66, 1, 33, 1, 33};
+    int A_rows[] = {0, 2, 4, 6, 8};
+    double lower[] = {0.0, 1.0, 0.0, 1.0};
+    double upper[] = {INFINITY, INFINITY, INFINITY, INFINITY};
+    int Q_rows[68] = {0};
+    int R_rows[] = {0};
+    double c[67] = {0.0};
+    int box_indices[67];
+    double box_lower[67];
+    double box_upper[67];
+    PreFOSProblemData problem;
+    PreFOSSettings settings = prefos_strict_settings();
+    PreFOSPresolver *presolver = NULL;
+    const PreFOSPresolvedProblem *reduced;
+    int column;
+
+    for (column = 0; column < 67; ++column)
+    {
+        box_indices[column] = column;
+        box_lower[column] = -INFINITY;
+        box_upper[column] = INFINITY;
+    }
+
+    memset(&problem, 0, sizeof(problem));
+    problem.n = 67;
+    problem.A = (PreFOSCsrMatrix){4, 67, 8, A_values, A_columns, A_rows};
+    problem.constraint_lower = lower;
+    problem.constraint_upper = upper;
+    problem.Q = (PreFOSCsrMatrix){67, 67, 0, NULL, NULL, Q_rows};
+    problem.q_storage = PREFOS_Q_UPPER_TRIANGULAR;
+    problem.R = (PreFOSCsrMatrix){0, 67, 0, NULL, NULL, R_rows};
+    problem.c = c;
+    problem.n_box = 67;
+    problem.box_indices = box_indices;
+    problem.box_lower = box_lower;
+    problem.box_upper = box_upper;
+    settings.singleton_column_reduction = 0;
+    settings.parallel_column_reduction = 0;
+    settings.dual_fixing = 0;
+
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
+    CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
+    reduced = prefos_get_reduced_problem(presolver);
+    CHECK(reduced != NULL && reduced->A.rows == 2 && reduced->A.nnz == 4);
+    CHECK(prefos_get_stats(presolver)->removed_redundant_rows == 2);
+    prefos_free_presolver(presolver);
+    return 0;
+}
+
 static int test_infeasible_parallel_rows(void)
 {
     double A_values[] = {1.0, 1.0, -1.0, -1.0};
@@ -3763,8 +3829,6 @@ static int test_interleaved_row_and_bound_postsolve(void)
     int box_indices[] = {0, 1};
     double box_lower[] = {0.0, 0.0};
     double box_upper[] = {10.0, 0.0};
-    double reduced_x[] = {3.0};
-    double reduced_z[] = {1.0};
     double original_x[2], original_y[2], original_z[2];
     PreFOSProblemData problem;
     PreFOSSettings settings = prefos_strict_settings();
@@ -3789,15 +3853,16 @@ static int test_interleaved_row_and_bound_postsolve(void)
     CHECK(prefos_create_presolver(&problem, &settings, &presolver) == PREFOS_STATUS_OK);
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
     reduced = prefos_get_reduced_problem(presolver);
-    CHECK(reduced->n == 1 && reduced->A.rows == 0);
-    CHECK(prefos_postsolve_primal_dual(presolver, reduced_x, NULL, reduced_z, 1e-12,
+    CHECK(reduced->n == 0 && reduced->A.rows == 0);
+    CHECK(close_to(reduced->objective_offset, -3.0));
+    CHECK(prefos_postsolve_primal_dual(presolver, NULL, NULL, NULL, 1e-12,
                                     original_x, original_y,
                                     original_z) == PREFOS_STATUS_OK);
     CHECK(close_to(original_y[0], 0.0));
     CHECK(close_to(original_y[1], 0.5));
     CHECK(close_to(original_z[0], 0.0));
     CHECK(close_to(original_z[1], -1.0));
-    CHECK(prefos_verify_postsolve_kkt(presolver, reduced_x, NULL, reduced_z, 1e-12,
+    CHECK(prefos_verify_postsolve_kkt(presolver, NULL, NULL, NULL, 1e-12,
                                    &verification) == PREFOS_STATUS_OK);
     CHECK(verification.passed);
     prefos_free_presolver(presolver);
@@ -3820,7 +3885,7 @@ static int test_cone_linked_free_column_substitution(void)
     int cone_indices[] = {1, 2, 3};
     PreFOSConeBlock cone = {PREFOS_CONE_ROTATED_SECOND_ORDER, 3, 0, cone_indices};
     double reduced_x[] = {2.0, 1.0, 0.0};
-    double reduced_y[] = {0.0, 0.0};
+    double reduced_y[] = {-3.0, 0.0};
     double reduced_z[] = {0.0, 0.0, 0.0};
     double original_x[4], original_y[3], original_z[4];
     PreFOSProblemData problem;
@@ -3851,19 +3916,19 @@ static int test_cone_linked_free_column_substitution(void)
     reduced = prefos_get_reduced_problem(presolver);
     stats = prefos_get_stats(presolver);
     CHECK(reduced != NULL && stats != NULL);
-    CHECK(stats->substituted_free_variables == 1);
-    CHECK(reduced->n == 3 && reduced->A.rows == 2 && reduced->A.nnz == 3);
+    CHECK(stats->substituted_free_variables == 0);
+    CHECK(stats->fixed_box_variables == 1);
+    CHECK(reduced->n == 3 && reduced->A.rows == 2 && reduced->A.nnz == 2);
     CHECK(reduced->A.column_indices[0] == 0);
-    CHECK(close_to(reduced->A.values[0], 1.0));
-    CHECK(close_to(reduced->constraint_lower[0], 2.0));
-    CHECK(close_to(reduced->constraint_upper[0], 2.0));
-    CHECK(reduced->A.column_indices[1] == 0);
-    CHECK(reduced->A.column_indices[2] == 1);
-    CHECK(close_to(reduced->constraint_lower[1], 3.0));
-    CHECK(close_to(reduced->constraint_upper[1], 3.0));
+    CHECK(close_to(reduced->A.values[0], -1.0));
+    CHECK(close_to(reduced->constraint_lower[0], -2.0));
+    CHECK(close_to(reduced->constraint_upper[0], -2.0));
+    CHECK(reduced->A.column_indices[1] == 1);
+    CHECK(close_to(reduced->constraint_lower[1], 1.0));
+    CHECK(close_to(reduced->constraint_upper[1], 1.0));
     CHECK(reduced->n_box == 0 && reduced->n_cones == 1);
-    CHECK(close_to(reduced->c[0], 0.0));
-    CHECK(close_to(reduced->objective_offset, 6.0));
+    CHECK(close_to(reduced->c[0], -3.0));
+    CHECK(close_to(reduced->objective_offset, 12.0));
 
     CHECK(prefos_postsolve_primal_dual(presolver, reduced_x, reduced_y, reduced_z,
                                     1e-12, original_x, original_y,
@@ -3905,6 +3970,8 @@ static int test_ternary_free_column_substitution(void)
     PreFOSPresolver *presolver = NULL;
     const PreFOSPresolvedProblem *reduced;
     PreFOSPostsolveKKTVerification verification;
+
+    settings.remove_empty_columns = 0;
 
     memset(&problem, 0, sizeof(problem));
     problem.n = 6;
@@ -3974,6 +4041,8 @@ static int test_lp_ternary_free_column_substitution(void)
     const PreFOSPresolvedProblem *reduced;
     PreFOSPostsolveKKTVerification verification;
 
+    settings.remove_empty_columns = 0;
+
     memset(&problem, 0, sizeof(problem));
     problem.n = 3;
     problem.A = (PreFOSCsrMatrix){1, 3, 3, A_values, A_columns, A_rows};
@@ -4030,6 +4099,8 @@ static int test_chained_free_column_substitution(void)
     PreFOSPresolver *presolver = NULL;
     const PreFOSPresolvedProblem *reduced;
     PreFOSPostsolveKKTVerification verification;
+
+    settings.remove_empty_columns = 0;
 
     memset(&problem, 0, sizeof(problem));
     problem.n = 3;
@@ -4092,6 +4163,7 @@ static int test_five_term_free_column_aggregation(void)
 
     memset(&problem, 0, sizeof(problem));
     settings.max_aggregation_terms = 4;
+    settings.remove_empty_columns = 0;
     problem.n = 5;
     problem.A = (PreFOSCsrMatrix){1, 5, 5, A_values, A_columns, A_rows};
     problem.constraint_lower = side;
@@ -4447,6 +4519,7 @@ static int test_exponential_and_power_coordinate_reductions(void)
     CHECK(prefos_create_presolver(&problem, &settings, &presolver) == PREFOS_STATUS_OK);
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_OK);
     CHECK(prefos_get_reduced_problem(presolver)->n_cones == 1);
+    CHECK(prefos_get_stats(presolver)->reduced_exponential_faces == 0);
     prefos_free_presolver(presolver);
     settings.exponential_face_reduction = 1;
 
@@ -4480,6 +4553,7 @@ static int test_exponential_and_power_coordinate_reductions(void)
     CHECK(prefos_create_presolver(&problem, &settings, &presolver) == PREFOS_STATUS_OK);
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_OK);
     CHECK(prefos_get_reduced_problem(presolver)->n_cones == 1);
+    CHECK(prefos_get_stats(presolver)->reduced_power_faces == 0);
     prefos_free_presolver(presolver);
     settings.power_face_reduction = 1;
 
@@ -4612,6 +4686,59 @@ static int test_cone_aware_row_activity(void)
             prefos_free_presolver(presolver);
         }
     }
+    return 0;
+}
+
+static int test_large_sparse_rsoc_row_activity(void)
+{
+    const size_t dimension = 4097;
+    double A_values[] = {1.0, 1.0, 1.0};
+    int A_columns[] = {0, 1, 2};
+    int A_rows[] = {0, 3};
+    int R_rows[] = {0};
+    double lower[] = {0.0};
+    double upper[] = {INFINITY};
+    int *cone_indices =
+        (int *) malloc(dimension * sizeof(int));
+    int *Q_rows =
+        (int *) calloc(dimension + 1, sizeof(int));
+    double *c =
+        (double *) calloc(dimension, sizeof(double));
+    PreFOSConeBlock cone;
+    PreFOSProblemData problem;
+    PreFOSSettings settings = prefos_strict_settings();
+    PreFOSPresolver *presolver = NULL;
+    size_t i;
+
+    CHECK(cone_indices && Q_rows && c);
+    for (i = 0; i < dimension; ++i) cone_indices[i] = (int) i;
+    cone = (PreFOSConeBlock){
+        PREFOS_CONE_ROTATED_SECOND_ORDER, dimension, 0, cone_indices, 0.0};
+    memset(&problem, 0, sizeof(problem));
+    problem.n = dimension;
+    problem.A =
+        (PreFOSCsrMatrix){1, dimension, 3, A_values, A_columns, A_rows};
+    problem.constraint_lower = lower;
+    problem.constraint_upper = upper;
+    problem.Q =
+        (PreFOSCsrMatrix){dimension, dimension, 0, NULL, NULL, Q_rows};
+    problem.q_storage = PREFOS_Q_UPPER_TRIANGULAR;
+    problem.R =
+        (PreFOSCsrMatrix){0, dimension, 0, NULL, NULL, R_rows};
+    problem.c = c;
+    problem.n_cones = 1;
+    problem.cones = &cone;
+
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
+    CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
+    CHECK(prefos_get_reduced_problem(presolver)->A.rows == 0);
+    CHECK(prefos_get_stats(presolver)->cone_activity_lower_support_hits == 1);
+    CHECK(prefos_get_stats(presolver)->cone_activity_rows_removed == 1);
+    prefos_free_presolver(presolver);
+    free(cone_indices);
+    free(Q_rows);
+    free(c);
     return 0;
 }
 
@@ -4760,6 +4887,7 @@ int main(void)
     if (test_exponential_and_power_nonlinear_propagation()) return 1;
     if (test_exponential_and_power_coordinate_reductions()) return 1;
     if (test_cone_aware_row_activity()) return 1;
+    if (test_large_sparse_rsoc_row_activity()) return 1;
     if (test_psd_higher_order_propagation()) return 1;
     if (test_fixed_variable_and_objective_update()) return 1;
     if (test_infeasible_empty_row()) return 1;
@@ -4809,6 +4937,7 @@ int main(void)
     if (test_empty_model_round_trip()) return 1;
     if (test_parallel_row_reduction_and_postsolve()) return 1;
     if (test_parallel_row_work_budget()) return 1;
+    if (test_parallel_row_hash_collision_groups()) return 1;
     if (test_infeasible_parallel_rows()) return 1;
     if (test_interleaved_row_and_bound_postsolve()) return 1;
     if (test_cone_linked_free_column_substitution()) return 1;

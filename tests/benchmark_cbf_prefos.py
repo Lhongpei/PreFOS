@@ -240,6 +240,23 @@ class PreFOSStats(ct.Structure):
         ("matrix_compaction_gpu_passes", ct.c_size_t),
         ("matrix_compaction_gpu_fallbacks", ct.c_size_t),
         ("matrix_compaction_gpu_milliseconds", ct.c_double),
+        ("initialization_milliseconds", ct.c_double),
+        ("affine_aggregation_milliseconds", ct.c_double),
+        ("fast_fixed_point_milliseconds", ct.c_double),
+        ("free_column_substitution_milliseconds", ct.c_double),
+        ("trivial_row_reduction_milliseconds", ct.c_double),
+        ("medium_fixed_point_milliseconds", ct.c_double),
+        ("parallel_column_reduction_milliseconds", ct.c_double),
+        ("matrix_compaction_milliseconds", ct.c_double),
+        ("quadratic_compaction_milliseconds", ct.c_double),
+        ("factor_compaction_milliseconds", ct.c_double),
+        ("domain_compaction_milliseconds", ct.c_double),
+        ("objective_compaction_milliseconds", ct.c_double),
+        ("presolve_total_milliseconds", ct.c_double),
+        ("fast_fixed_point_passes", ct.c_size_t),
+        ("fast_fixed_point_rounds", ct.c_size_t),
+        ("medium_fixed_point_rounds", ct.c_size_t),
+        ("residual_row_substitutions", ct.c_size_t),
     ]
 
 

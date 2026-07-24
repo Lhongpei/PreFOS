@@ -362,9 +362,8 @@ static PreFOSStatus accumulate_transformed_column(const PreFOSPresolver *presolv
     if (presolver->is_substituted[column])
     {
         size_t start = presolver->substitution_term_start[column];
-        unsigned char count = presolver->substitution_term_count[column];
-        if (count == 0 || count > PREFOS_MAX_AGGREGATION_TERMS ||
-            start > presolver->n_substitution_terms ||
+        size_t count = presolver->substitution_term_count[column];
+        if (count == 0 || start > presolver->n_substitution_terms ||
             count > presolver->n_substitution_terms - start ||
             !prefos_internal_safe_add_product(shift, coefficient,
                                            presolver->substitution_constant[column]))
@@ -413,9 +412,8 @@ static PreFOSStatus accumulate_transformed_a_row(const PreFOSPresolver *presolve
         double coefficient = A->values[p];
         PreFOSStatus status;
         if (coefficient == 0.0) continue;
-        if (presolver->is_substituted[column] &&
-            presolver->substitution_keeps_source_row[column] &&
-            presolver->substitution_source_row[column] == (int) row)
+        if (!prefos_internal_term_is_active_in_row(
+                presolver, row, column))
             continue;
         status = accumulate_transformed_column(presolver, column, coefficient, 0,
                                                row_values, row_marks,
@@ -437,55 +435,99 @@ static void clear_transformed_a_row(double *row_values, int *row_marks,
     }
 }
 
+static PreFOSStatus reserve_compacted_a_entries(PreFOSCsrMatrix *matrix,
+                                                size_t *capacity,
+                                                size_t required)
+{
+    size_t new_capacity;
+    double *new_values;
+    int *new_columns;
+
+    if (required <= *capacity) return PREFOS_STATUS_OK;
+    if (required > (size_t) INT_MAX) return PREFOS_STATUS_OUT_OF_MEMORY;
+    new_capacity = *capacity == 0 ? 1024 : *capacity;
+    while (new_capacity < required)
+    {
+        size_t grown = new_capacity + new_capacity / 2 + 1;
+        if (grown > (size_t) INT_MAX || grown <= new_capacity)
+        {
+            new_capacity = (size_t) INT_MAX;
+            break;
+        }
+        new_capacity = grown;
+    }
+    if (new_capacity < required) return PREFOS_STATUS_OUT_OF_MEMORY;
+
+    new_values =
+        (double *) realloc(matrix->values, new_capacity * sizeof(double));
+    if (!new_values) return PREFOS_STATUS_OUT_OF_MEMORY;
+    matrix->values = new_values;
+    new_columns =
+        (int *) realloc(matrix->column_indices, new_capacity * sizeof(int));
+    if (!new_columns) return PREFOS_STATUS_OUT_OF_MEMORY;
+    matrix->column_indices = new_columns;
+    *capacity = new_capacity;
+    return PREFOS_STATUS_OK;
+}
+
 PreFOSStatus prefos_internal_compact_a(PreFOSPresolver *presolver)
 {
     const PreFOSProblemData *source = &presolver->original;
     PreFOSPresolvedProblem *target = &presolver->reduced;
-    unsigned char *keep_row;
-    double *shifts;
     double *row_values;
     int *row_marks;
     int *touched_columns;
-    size_t row, kept_rows = 0, nnz = 0;
-    int write = 0;
+    size_t row, kept_rows = 0, write = 0, entry_capacity;
+    size_t removed_empty_rows = 0;
     PreFOSStatus status = PREFOS_STATUS_OK;
 
     if (presolver->stats.substituted_free_variables == 0)
         return compact_a_without_substitutions(presolver);
 
-    keep_row = (unsigned char *) calloc(source->A.rows, sizeof(unsigned char));
-    shifts = (double *) calloc(source->A.rows, sizeof(double));
     row_values = (double *) calloc(target->n, sizeof(double));
     row_marks = (int *) prefos_internal_alloc_array(target->n, sizeof(int));
     touched_columns = (int *) prefos_internal_alloc_array(target->n, sizeof(int));
-    if ((source->A.rows > 0 && (!keep_row || !shifts)) ||
-        (target->n > 0 && (!row_values || !row_marks || !touched_columns)))
+    target->A.row_pointers = (int *) prefos_internal_alloc_array(
+        source->A.rows + 1, sizeof(int));
+    target->constraint_lower = (double *) prefos_internal_alloc_array(
+        source->A.rows, sizeof(double));
+    target->constraint_upper = (double *) prefos_internal_alloc_array(
+        source->A.rows, sizeof(double));
+    entry_capacity = source->A.nnz;
+    target->A.values =
+        (double *) prefos_internal_alloc_array(entry_capacity, sizeof(double));
+    target->A.column_indices =
+        (int *) prefos_internal_alloc_array(entry_capacity, sizeof(int));
+    if ((target->n > 0 && (!row_values || !row_marks || !touched_columns)) ||
+        !target->A.row_pointers ||
+        (source->A.rows > 0 &&
+         (!target->constraint_lower || !target->constraint_upper)) ||
+        (entry_capacity > 0 &&
+         (!target->A.values || !target->A.column_indices)))
     {
-        free(keep_row);
-        free(shifts);
-        free(row_values);
-        free(row_marks);
-        free(touched_columns);
-        return PREFOS_STATUS_OUT_OF_MEMORY;
+        status = PREFOS_STATUS_OUT_OF_MEMORY;
+        goto compact_failure;
     }
     for (row = 0; row < target->n; ++row) row_marks[row] = -1;
 
     for (row = 0; row < source->A.rows; ++row)
     {
         size_t remaining = 0, n_touched = 0, position;
-        double lower, upper;
+        double shift, lower, upper;
+        presolver->original_to_reduced_rows[row] = -1;
         if (presolver->remove_rows[row]) continue;
         status =
             accumulate_transformed_a_row(presolver, row, row_values, row_marks,
-                                         touched_columns, &n_touched, &shifts[row]);
+                                         touched_columns, &n_touched, &shift);
         if (status != PREFOS_STATUS_OK) goto compact_failure;
         for (position = 0; position < n_touched; ++position)
             if (row_values[touched_columns[position]] != 0.0) ++remaining;
-        clear_transformed_a_row(row_values, row_marks, touched_columns, n_touched);
-        lower = presolver->working_constraint_lower[row] - shifts[row];
-        upper = presolver->working_constraint_upper[row] - shifts[row];
+        lower = presolver->working_constraint_lower[row] - shift;
+        upper = presolver->working_constraint_upper[row] - shift;
         if (isnan(lower) || isnan(upper))
         {
+            clear_transformed_a_row(row_values, row_marks, touched_columns,
+                                    n_touched);
             status = PREFOS_STATUS_NUMERICAL_ERROR;
             goto compact_failure;
         }
@@ -494,53 +536,29 @@ PreFOSStatus prefos_internal_compact_a(PreFOSPresolver *presolver)
             if (lower > presolver->settings.feasibility_tolerance ||
                 upper < -presolver->settings.feasibility_tolerance)
             {
+                clear_transformed_a_row(row_values, row_marks, touched_columns,
+                                        n_touched);
                 status = PREFOS_STATUS_PRIMAL_INFEASIBLE;
                 goto compact_failure;
             }
-            ++presolver->stats.removed_empty_rows;
+            clear_transformed_a_row(row_values, row_marks, touched_columns,
+                                    n_touched);
+            ++removed_empty_rows;
+            continue;
         }
-        else
+
+        status = reserve_compacted_a_entries(&target->A, &entry_capacity,
+                                             write + remaining);
+        if (status != PREFOS_STATUS_OK)
         {
-            keep_row[row] = 1;
-            ++kept_rows;
-            nnz += remaining;
+            clear_transformed_a_row(row_values, row_marks, touched_columns,
+                                    n_touched);
+            goto compact_failure;
         }
-    }
-
-    target->A.rows = kept_rows;
-    target->A.cols = target->n;
-    target->A.nnz = nnz;
-    target->A.row_pointers = (int *) calloc(kept_rows + 1, sizeof(int));
-    target->A.values = (double *) prefos_internal_alloc_array(nnz, sizeof(double));
-    target->A.column_indices = (int *) prefos_internal_alloc_array(nnz, sizeof(int));
-    target->constraint_lower =
-        (double *) prefos_internal_alloc_array(kept_rows, sizeof(double));
-    target->constraint_upper =
-        (double *) prefos_internal_alloc_array(kept_rows, sizeof(double));
-    if (!target->A.row_pointers ||
-        (nnz > 0 && (!target->A.values || !target->A.column_indices)) ||
-        (kept_rows > 0 && (!target->constraint_lower || !target->constraint_upper)))
-    {
-        status = PREFOS_STATUS_OUT_OF_MEMORY;
-        goto compact_failure;
-    }
-
-    kept_rows = 0;
-    for (row = 0; row < source->A.rows; ++row)
-    {
-        size_t n_touched = 0, position;
-        double ignored_shift;
-        if (!keep_row[row]) continue;
         presolver->original_to_reduced_rows[row] = (int) kept_rows;
-        target->A.row_pointers[kept_rows] = write;
-        target->constraint_lower[kept_rows] =
-            presolver->working_constraint_lower[row] - shifts[row];
-        target->constraint_upper[kept_rows] =
-            presolver->working_constraint_upper[row] - shifts[row];
-        status = accumulate_transformed_a_row(presolver, row, row_values, row_marks,
-                                              touched_columns, &n_touched,
-                                              &ignored_shift);
-        if (status != PREFOS_STATUS_OK) goto compact_failure;
+        target->A.row_pointers[kept_rows] = (int) write;
+        target->constraint_lower[kept_rows] = lower;
+        target->constraint_upper[kept_rows] = upper;
         for (position = 0; position < n_touched; ++position)
         {
             int mapped = touched_columns[position];
@@ -554,17 +572,22 @@ PreFOSStatus prefos_internal_compact_a(PreFOSPresolver *presolver)
         clear_transformed_a_row(row_values, row_marks, touched_columns, n_touched);
         ++kept_rows;
     }
-    target->A.row_pointers[kept_rows] = write;
-    free(keep_row);
-    free(shifts);
+    target->A.row_pointers[kept_rows] = (int) write;
+    target->A.rows = kept_rows;
+    target->A.cols = target->n;
+    target->A.nnz = write;
+    presolver->stats.removed_empty_rows += removed_empty_rows;
     free(row_values);
     free(row_marks);
     free(touched_columns);
     return PREFOS_STATUS_OK;
 
 compact_failure:
-    free(keep_row);
-    free(shifts);
+    prefos_internal_free_csr(&target->A);
+    free(target->constraint_lower);
+    free(target->constraint_upper);
+    target->constraint_lower = NULL;
+    target->constraint_upper = NULL;
     free(row_values);
     free(row_marks);
     free(touched_columns);

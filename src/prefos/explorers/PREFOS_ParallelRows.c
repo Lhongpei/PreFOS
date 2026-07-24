@@ -107,7 +107,7 @@ static PreFOSStatus process_parallel_group(PreFOSPresolver *presolver,
         if (row == reduction.kept_row) continue;
         status = append_deleted_row_record(presolver, row);
         if (status != PREFOS_STATUS_OK) return status;
-        presolver->remove_rows[row] = 1;
+        prefos_internal_mark_removed_row(presolver, (size_t) row);
         ++presolver->stats.removed_redundant_rows;
     }
     return PREFOS_STATUS_OK;

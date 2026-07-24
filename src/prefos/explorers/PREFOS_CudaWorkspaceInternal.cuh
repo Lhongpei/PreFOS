@@ -41,6 +41,7 @@ struct PreFOSCudaWorkspace
     int *cone_indices;
     int *cone_matrix_orders;
     double *cone_power_alphas;
+    unsigned char *cone_flags;
     int *column_to_cone;
     int *column_to_cone_position;
 
@@ -66,6 +67,7 @@ struct PreFOSCudaWorkspace
     double *affine_upper_bounds;
     double *affine_lower_candidates;
     double *affine_upper_candidates;
+    unsigned char *affine_cone_flags;
 
     int cone_activity_groups_ready;
     size_t n_cone_activity_groups;

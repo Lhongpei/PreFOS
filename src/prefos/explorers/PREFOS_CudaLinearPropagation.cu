@@ -167,6 +167,7 @@ void free_context(PreFOSCudaLinearPropagationContext *context)
         cudaFreeAsync(context->cone_indices, context->stream);
         cudaFreeAsync(context->cone_matrix_orders, context->stream);
         cudaFreeAsync(context->cone_power_alphas, context->stream);
+        cudaFreeAsync(context->cone_flags, context->stream);
         cudaFreeAsync(context->column_to_cone, context->stream);
         cudaFreeAsync(context->column_to_cone_position, context->stream);
         cudaFreeAsync(context->csc_column_pointers, context->stream);
@@ -185,6 +186,7 @@ void free_context(PreFOSCudaLinearPropagationContext *context)
         cudaFreeAsync(context->affine_upper_bounds, context->stream);
         cudaFreeAsync(context->affine_lower_candidates, context->stream);
         cudaFreeAsync(context->affine_upper_candidates, context->stream);
+        cudaFreeAsync(context->affine_cone_flags, context->stream);
         cudaFreeAsync(context->cone_activity_group_keys, context->stream);
         cudaFreeAsync(context->cone_activity_group_offsets, context->stream);
         cudaFreeAsync(context->cone_activity_sorted_positions, context->stream);
@@ -607,6 +609,8 @@ extern "C" PreFOSCudaPropagationStatus prefos_cuda_workspace_create(
         allocate_device(&context->cone_matrix_orders, n_cones, context->stream));
     PREFOS_CUDA_CHECK(
         allocate_device(&context->cone_power_alphas, n_cones, context->stream));
+    PREFOS_CUDA_CHECK(
+        allocate_device(&context->cone_flags, n_cones, context->stream));
     PREFOS_CUDA_CHECK(
         allocate_device(&context->column_to_cone, n_cones > 0 ? columns : 0,
                         context->stream));

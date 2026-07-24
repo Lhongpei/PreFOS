@@ -14,7 +14,7 @@ static size_t doubleton_fill(const PreFOSPresolver *presolver,
     size_t fill = 0;
     int position;
     for (position = workspace->starts[pivot_column];
-         position < workspace->starts[pivot_column + 1]; ++position)
+         position < workspace->ends[pivot_column]; ++position)
     {
         int row = workspace->rows[position];
         int p, found = 0;
@@ -47,17 +47,44 @@ PreFOSStatus prefos_internal_reduce_bounded_doubletons(
         double coefficients[2], lower, upper, pivot, target_coefficient;
         double pivot_lower, pivot_upper, target_lower, target_upper;
         double alpha, beta, mapped_lower = -INFINITY, mapped_upper = INFINITY;
+        double fixed_shift = 0.0;
         double scales[1];
         int targets[1];
         size_t live;
-        int candidate;
-        if (presolver->remove_rows[row]) continue;
-        if (prefos_internal_effective_row_bounds(
-                presolver, row, &lower, &upper) != PREFOS_STATUS_OK)
-            return PREFOS_STATUS_NUMERICAL_ERROR;
+        int candidate, position;
+        if (presolver->remove_rows[row] || workspace->dirty_row[row]) continue;
+        lower = presolver->working_constraint_lower[row];
+        upper = presolver->working_constraint_upper[row];
         if (!isfinite(lower) || lower != upper) continue;
-        live = prefos_internal_collect_live_row(
-            presolver, row, columns, coefficients, 2);
+        live = 0;
+        for (position = problem->A.row_pointers[row];
+             position < problem->A.row_pointers[row + 1]; ++position)
+        {
+            int column = problem->A.column_indices[position];
+            double coefficient = problem->A.values[position];
+            if (coefficient == 0.0) continue;
+            if (presolver->is_fixed[column])
+            {
+                if (!prefos_internal_safe_add_product(
+                        &fixed_shift, coefficient,
+                        presolver->fixed_values[column]))
+                    return PREFOS_STATUS_NUMERICAL_ERROR;
+                continue;
+            }
+            if (presolver->is_substituted[column] ||
+                presolver->is_parallel_removed[column])
+                continue;
+            if (live < 2)
+            {
+                columns[live] = column;
+                coefficients[live] = coefficient;
+            }
+            ++live;
+        }
+        lower -= fixed_shift;
+        upper -= fixed_shift;
+        if (isnan(lower) || isnan(upper))
+            return PREFOS_STATUS_NUMERICAL_ERROR;
         if (live != 2) continue;
         for (candidate = 0; candidate < 2; ++candidate)
         {
@@ -85,8 +112,7 @@ PreFOSStatus prefos_internal_reduce_bounded_doubletons(
             if (!isfinite(presolver->working_box_lower[pivot_box]) &&
                 !isfinite(presolver->working_box_upper[pivot_box]))
                 continue;
-            if (workspace->starts[possible_pivot + 1] -
-                    workspace->starts[possible_pivot] >
+            if (workspace->live_degrees[possible_pivot] >
                 presolver->settings.max_aggregation_column_degree)
                 continue;
             if (doubleton_fill(presolver, workspace, possible_pivot,

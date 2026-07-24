@@ -50,6 +50,7 @@ set(PREFOS_SOURCES
   src/prefos/core/PREFOS_AffineConeCompaction.c
   src/prefos/core/PREFOS_AffineConeFaces.c
   src/prefos/core/PREFOS_MatrixCompaction.c
+  src/prefos/core/PREFOS_PassManager.c
   src/prefos/core/PREFOS_Postsolve.c
   src/prefos/core/PREFOS_Problem.c
   src/prefos/core/PREFOS_Timer.c
@@ -74,6 +75,7 @@ set(PREFOS_SOURCES
   src/prefos/explorers/PREFOS_RedundantBounds.c
   src/prefos/explorers/PREFOS_SDPStructureAnalysis.c
   src/prefos/explorers/PREFOS_SingletonColumns.c
+  src/prefos/explorers/PREFOS_TrivialReductions.c
 )
 
 if(PREFOS_ENABLE_CUDA)

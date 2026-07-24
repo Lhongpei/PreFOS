@@ -104,7 +104,7 @@ PreFOSStatus prefos_postsolve_primal(const PreFOSPresolver *presolver,
             &presolver->transformations.events[i - 1];
         const PresolveColumnTransformationRecord *record;
         double recovered_value;
-        unsigned char term_count;
+        size_t term_count;
         size_t term, start;
         if (event->type != PRESOLVE_TRANSFORMATION_COLUMN) continue;
         record =
@@ -125,8 +125,7 @@ PreFOSStatus prefos_postsolve_primal(const PreFOSPresolver *presolver,
             return PREFOS_STATUS_NUMERICAL_ERROR;
         term_count = presolver->substitution_term_count[record->column];
         start = presolver->substitution_term_start[record->column];
-        if (term_count == 0 || term_count > PREFOS_MAX_AGGREGATION_TERMS ||
-            start > presolver->n_substitution_terms ||
+        if (term_count == 0 || start > presolver->n_substitution_terms ||
             term_count > presolver->n_substitution_terms - start)
             return PREFOS_STATUS_NUMERICAL_ERROR;
         recovered_value = presolver->substitution_constant[record->column];

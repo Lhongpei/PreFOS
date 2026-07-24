@@ -25,9 +25,9 @@ static int parallel_column_is_active(const void *context, size_t column)
             presolver, workspace, (int) column) ||
         workspace->protected_target[column])
         return 0;
-    for (p = workspace->starts[column]; p < workspace->starts[column + 1]; ++p)
+    for (p = workspace->starts[column]; p < workspace->ends[column]; ++p)
         if (workspace->dirty_row[workspace->rows[p]]) return 0;
-    return workspace->starts[column] < workspace->starts[column + 1];
+    return workspace->starts[column] < workspace->ends[column];
 }
 
 static double merged_lower(double target_lower, double source_lower,
@@ -125,9 +125,10 @@ prefos_internal_reduce_parallel_column_groups(
                                   workspace->values,
                                   workspace->rows,
                                   workspace->starts,
-                                  workspace->starts + 1,
+                                  workspace->ends,
                                   1};
-    if (presolver->settings.structural_reductions_gpu)
+    if (presolver->settings.structural_reductions_gpu &&
+        workspace->gpu_csc_valid)
     {
         PreFOSCudaPropagationStatus cuda_status =
             PREFOS_CUDA_PROPAGATION_UNAVAILABLE;
@@ -278,6 +279,8 @@ prefos_internal_reduce_parallel_column_groups(
             presolver->working_box_upper[target_box] = new_upper;
             presolver->propagation_lower[target] = new_lower;
             presolver->propagation_upper[target] = new_upper;
+            presolver->propagation_lower[source] = 0.0;
+            presolver->propagation_upper[source] = 0.0;
             presolver->is_parallel_removed[source] = 1;
             presolver->variable_to_box[source] = -1;
             workspace->protected_target[source] = 1;

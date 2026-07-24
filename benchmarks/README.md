@@ -18,6 +18,9 @@ The drivers are located in `tests/`:
   SDPA models.
 - `benchmark_clarabel_gurobi.py` compares external presolve pipelines with
   Clarabel as the common downstream solver.
+- `benchmark_lp_pslp.py` compares CPU-only PreFOS and upstream PSLP on the
+  same LP matrix and bounds. It reports constructor and presolve time
+  separately and records the reduced row, column, and nonzero counts.
 
 Store downloaded instances under `benchmarks/data/` and generated JSONL,
 tables, logs, and dated reports under `benchmarks/results/`. These directories

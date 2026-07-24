@@ -133,9 +133,10 @@ static PreFOSStatus commit_coordinate(PreFOSPresolver *presolver, int column,
     presolver->affine_aggregation_pivots[column] = candidate->pivot;
     if (candidate->term_count == 0)
     {
-        presolver->is_fixed[column] = 1;
-        presolver->fixed_values[column] = candidate->constant;
-        presolver->remove_rows[candidate->source_row] = 1;
+        prefos_internal_mark_fixed_column(
+            presolver, column, candidate->constant);
+        prefos_internal_mark_removed_row(
+            presolver, (size_t) candidate->source_row);
         ++presolver->stats.fixed_cone_variables;
         ++presolver->stats.aggregated_affine_cone_coordinates;
         return PREFOS_STATUS_OK;
@@ -160,8 +161,7 @@ static PreFOSStatus commit_coordinate(PreFOSPresolver *presolver, int column,
 
     start = presolver->n_substitution_terms;
     presolver->is_substituted[column] = 1;
-    presolver->substitution_term_count[column] =
-        (unsigned char) candidate->term_count;
+    presolver->substitution_term_count[column] = candidate->term_count;
     presolver->substitution_term_start[column] = start;
     presolver->substitution_constant[column] = candidate->constant;
     for (term = 0; term < candidate->term_count; ++term)
@@ -172,7 +172,8 @@ static PreFOSStatus commit_coordinate(PreFOSPresolver *presolver, int column,
         presolver->affine_protected_columns[target] = 1;
     }
     presolver->n_substitution_terms += candidate->term_count;
-    presolver->remove_rows[candidate->source_row] = 1;
+    prefos_internal_mark_removed_row(
+        presolver, (size_t) candidate->source_row);
     ++presolver->stats.aggregated_affine_cone_coordinates;
     return PREFOS_STATUS_OK;
 }

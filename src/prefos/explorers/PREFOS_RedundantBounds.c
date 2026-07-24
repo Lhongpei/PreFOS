@@ -120,7 +120,7 @@ prefos_internal_remove_redundant_box_bounds(PreFOSPresolver *presolver)
             if (isfinite(lower) && !isfinite(upper))
             {
                 for (p = workspace.starts[column];
-                     p < workspace.starts[column + 1]; ++p)
+                     p < workspace.ends[column]; ++p)
                 {
                     int row = workspace.rows[p];
                     if (!presolver->remove_rows[row] &&
@@ -137,7 +137,7 @@ prefos_internal_remove_redundant_box_bounds(PreFOSPresolver *presolver)
             else if (!isfinite(lower) && isfinite(upper))
             {
                 for (p = workspace.starts[column];
-                     p < workspace.starts[column + 1]; ++p)
+                     p < workspace.ends[column]; ++p)
                 {
                     int row = workspace.rows[p];
                     if (!presolver->remove_rows[row] &&

@@ -35,9 +35,10 @@ PreFOSStatus prefos_internal_reduce_empty_and_dual_fixed_columns(
         upper = presolver->working_box_upper[box_position];
         objective = workspace->objective[column];
 
-        if ((workspace->gpu_stats_valid && workspace->gpu_degrees[column] == 0) ||
+        if ((workspace->gpu_stats_valid &&
+             workspace->gpu_degrees[column] == 0) ||
             (!workspace->gpu_stats_valid &&
-             workspace->starts[column] == workspace->starts[column + 1]))
+             workspace->live_degrees[column] == 0))
         {
             if (!presolver->settings.remove_empty_columns) continue;
             if (objective > zero_tolerance)
@@ -56,9 +57,7 @@ PreFOSStatus prefos_internal_reduce_empty_and_dual_fixed_columns(
             ++presolver->stats.removed_empty_columns;
             continue;
         }
-        if (!presolver->settings.dual_fixing ||
-            fabs(objective) <= zero_tolerance)
-            continue;
+        if (!presolver->settings.dual_fixing) continue;
 
         if (workspace->gpu_stats_valid)
         {
@@ -67,10 +66,17 @@ PreFOSStatus prefos_internal_reduce_empty_and_dual_fixed_columns(
         }
         for (p = workspace->starts[column];
              !workspace->gpu_stats_valid &&
-             p < workspace->starts[column + 1]; ++p)
+             p < workspace->ends[column]; ++p)
         {
             int row = workspace->rows[p];
             double coefficient = workspace->values[p];
+            if (presolver->remove_rows[row]) continue;
+            if (workspace->dirty_row[row])
+            {
+                down_locked = 1;
+                up_locked = 1;
+                break;
+            }
             if (coefficient > 0.0)
             {
                 down_locked |=
@@ -96,6 +102,21 @@ PreFOSStatus prefos_internal_reduce_empty_and_dual_fixed_columns(
             if (!isfinite(upper)) return PREFOS_STATUS_PRIMAL_UNBOUNDED;
             prefos_internal_mark_fixed_column(presolver, (int) column, upper);
             ++presolver->stats.dual_fixed_columns;
+        }
+        else if (fabs(objective) <= zero_tolerance)
+        {
+            if (!down_locked && isfinite(lower))
+            {
+                prefos_internal_mark_fixed_column(
+                    presolver, (int) column, lower);
+                ++presolver->stats.dual_fixed_columns;
+            }
+            else if (!up_locked && isfinite(upper))
+            {
+                prefos_internal_mark_fixed_column(
+                    presolver, (int) column, upper);
+                ++presolver->stats.dual_fixed_columns;
+            }
         }
     }
     return PREFOS_STATUS_OK;

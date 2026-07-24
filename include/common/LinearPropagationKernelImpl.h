@@ -77,36 +77,62 @@ static inline void load_domain(const PresolveLinearPropagationOps *ops, int colu
                           (!ops->candidate_map || ops->candidate_map[column] >= 0);
 }
 
-static inline int add_activity_term(long double *sum, double coefficient,
+static inline int linear_term_is_active(
+    const PresolveLinearPropagationOps *ops, int column)
+{
+    if (ops->row_excluded_columns)
+    {
+        int excluded = ops->row_excluded_columns[ops->row_index];
+        if (excluded >= 0) return column != excluded;
+        if (excluded == -1) return 1;
+    }
+    return !ops->row_exclusion_flags ||
+           !ops->row_exclusion_flags[column] ||
+           ops->row_exclusion_sources[column] != ops->row_index;
+}
+
+static inline int add_activity_term(double *sum, double coefficient,
                                     double bound, int is_lower, int outward)
 {
-    long double left = (long double) coefficient;
-    long double right = (long double) bound;
-    long double product = left * right;
-    long double old_sum, result;
-
-    if (!isfinite(product)) return 0;
-    if (outward)
+    if (!outward)
     {
-        long double product_error = fmal(left, right, -product);
+        double product = coefficient * bound;
+        double result = *sum + product;
+        if (!isfinite(product) || !isfinite(result)) return 0;
+        *sum = result;
+        return 1;
+    }
+    {
+        long double left = (long double) coefficient;
+        long double right = (long double) bound;
+        long double product = left * right;
+        long double old_sum, result;
+        double converted;
+        long double product_error;
+        if (!isfinite(product)) return 0;
+        product_error = fmal(left, right, -product);
         if ((is_lower && product_error < 0.0L) ||
             (!is_lower && product_error > 0.0L))
-            product = nextafterl(product, is_lower ? -INFINITY : INFINITY);
-    }
-
-    old_sum = *sum;
-    result = old_sum + product;
-    if (!isfinite(result)) return 0;
-    if (outward)
-    {
+            product = nextafterl(
+                product, is_lower ? -INFINITY : INFINITY);
+        old_sum = (long double) *sum;
+        result = old_sum + product;
+        if (!isfinite(result)) return 0;
+        {
         long double recovered = result - old_sum;
         long double error = (old_sum - (result - recovered)) + (product - recovered);
         if ((is_lower && error < 0.0L) || (!is_lower && error > 0.0L))
             result = nextafterl(result, is_lower ? -INFINITY : INFINITY);
+        }
+        converted = (double) result;
+        if (!isfinite(converted)) return 0;
+        if (is_lower && (long double) converted > result)
+            converted = nextafter(converted, -INFINITY);
+        if (!is_lower && (long double) converted < result)
+            converted = nextafter(converted, INFINITY);
+        *sum = converted;
+        return 1;
     }
-    if (!isfinite(result)) return 0;
-    *sum = result;
-    return 1;
 }
 
 static inline int presolve_internal_compute_linear_activity(
@@ -121,7 +147,9 @@ static inline int presolve_internal_compute_linear_activity(
         PresolveScalarDomain domain;
         double coefficient = values[position];
         double min_bound, max_bound;
-        if (coefficient == 0.0) continue;
+        if (coefficient == 0.0 ||
+            !linear_term_is_active(ops, columns[position]))
+            continue;
         ++activity->n_nonzeros;
         load_domain(ops, columns[position], &domain);
         min_bound = coefficient > 0.0 ? domain.lower : domain.upper;
@@ -184,8 +212,9 @@ static inline int compute_residual(const PresolveLinearPropagationRow *row,
 
     if (n_infinite == 0)
     {
-        long double activity =
-            use_minimum ? row->finite_min_activity : row->finite_max_activity;
+        long double activity = (long double)
+            (use_minimum ? row->finite_min_activity
+                         : row->finite_max_activity);
         *residual =
             activity - (long double) target_coefficient * (long double) target_bound;
         return 1;
@@ -198,7 +227,9 @@ static inline int compute_residual(const PresolveLinearPropagationRow *row,
         double coefficient, bound;
         if (position == target_position) continue;
         coefficient = row->values[position];
-        if (coefficient == 0.0) continue;
+        if (coefficient == 0.0 ||
+            !linear_term_is_active(ops, row->columns[position]))
+            continue;
         load_domain(ops, row->columns[position], &domain);
         if (selected_bound_is_infinite(&domain, coefficient, use_minimum)) return 0;
         bound = selected_bound(&domain, coefficient, use_minimum);
@@ -261,28 +292,49 @@ presolve_internal_propagate_linear_row(PresolveLinearPropagationRow *row,
 {
     size_t n_changed = 0;
     int position;
+    int propagate_minimum =
+        (!row->upper_is_infinite && row->n_infinite_min <= 1) ||
+        (row->upper_is_infinite && row->n_infinite_min == 1 &&
+         row->n_infinite_max == 0);
+    int propagate_maximum =
+        (!row->lower_is_infinite && row->n_infinite_max <= 1) ||
+        (row->lower_is_infinite && row->n_infinite_max == 1 &&
+         row->n_infinite_min == 0);
     *stopped = 0;
+    if (!propagate_minimum && !propagate_maximum) return 0;
     for (position = 0; position < row->length; ++position)
     {
         PresolveScalarDomain domain;
         PresolveKernelUpdate update;
-        if (row->values[position] == 0.0) continue;
+        if (row->values[position] == 0.0 ||
+            !linear_term_is_active(ops, row->columns[position]))
+            continue;
         load_domain(ops, row->columns[position], &domain);
         if (!domain.can_tighten) continue;
-        update = propagate_candidate(row, ops, position, &domain, 1, row->upper,
-                                     row->upper_is_infinite, &n_changed);
-        if (update == PRESOLVE_KERNEL_STOP)
+        if (propagate_minimum)
         {
-            *stopped = 1;
-            break;
+            update = propagate_candidate(
+                row, ops, position, &domain, 1, row->upper,
+                row->upper_is_infinite, &n_changed);
+            if (update == PRESOLVE_KERNEL_STOP)
+            {
+                *stopped = 1;
+                break;
+            }
         }
-        load_domain(ops, row->columns[position], &domain);
-        update = propagate_candidate(row, ops, position, &domain, 0, row->lower,
-                                     row->lower_is_infinite, &n_changed);
-        if (update == PRESOLVE_KERNEL_STOP)
+        if (propagate_maximum)
         {
-            *stopped = 1;
-            break;
+            if (propagate_minimum &&
+                update == PRESOLVE_KERNEL_CHANGED)
+                load_domain(ops, row->columns[position], &domain);
+            update = propagate_candidate(
+                row, ops, position, &domain, 0, row->lower,
+                row->lower_is_infinite, &n_changed);
+            if (update == PRESOLVE_KERNEL_STOP)
+            {
+                *stopped = 1;
+                break;
+            }
         }
     }
     return n_changed;

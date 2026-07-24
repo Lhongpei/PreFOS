@@ -236,8 +236,8 @@ PreFOSStatus prefos_affine_face_append_transformation(
 
     if (term_count == 0)
     {
-        presolver->is_fixed[pivot] = 1;
-        presolver->fixed_values[pivot] = (double) constant;
+        prefos_internal_mark_fixed_column(
+            presolver, pivot, (double) constant);
         ++presolver->stats.fixed_affine_face_variables;
     }
     else
@@ -246,7 +246,7 @@ PreFOSStatus prefos_affine_face_append_transformation(
         unsigned char next_depth =
             (unsigned char) (presolver->substitution_incoming_depth[pivot] + 1);
         presolver->is_substituted[pivot] = 1;
-        presolver->substitution_term_count[pivot] = (unsigned char) term_count;
+        presolver->substitution_term_count[pivot] = term_count;
         presolver->substitution_term_start[pivot] = start;
         presolver->substitution_constant[pivot] = (double) constant;
         for (position = 0; position < term_count; ++position)

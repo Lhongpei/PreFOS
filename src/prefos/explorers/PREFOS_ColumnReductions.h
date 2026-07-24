@@ -6,13 +6,18 @@
 #ifndef PREFOS_COLUMN_REDUCTIONS_H
 #define PREFOS_COLUMN_REDUCTIONS_H
 
-#include "PREFOS_Internal.h"
+#include "PREFOS_ColumnReductionInternal.h"
 
 PREFOS_INTERNAL PreFOSStatus
-prefos_internal_reduce_linear_columns(PreFOSPresolver *presolver);
+prefos_internal_reduce_linear_columns(
+    PreFOSPresolver *presolver, int allow_one_sided_singletons);
 
 PREFOS_INTERNAL PreFOSStatus
 prefos_internal_reduce_parallel_columns(PreFOSPresolver *presolver);
+
+PREFOS_INTERNAL PreFOSStatus
+prefos_internal_reduce_parallel_columns_in_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
 
 PREFOS_INTERNAL PreFOSStatus
 prefos_internal_remove_redundant_box_bounds(PreFOSPresolver *presolver);
