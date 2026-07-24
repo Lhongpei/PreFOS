@@ -55,16 +55,18 @@ cmake -S . -B build-gpu -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-gpu -j
 ```
 
-Set `linear_propagation_gpu = 1` to request bulk linear, direct-cone, and
-alternating row-to-cone envelope propagation. Set
+Set `linear_propagation_gpu = 1` to request bulk linear, direct-cone,
+affine-cone, and alternating row-to-cone envelope propagation. Set
 `structural_reductions_gpu = 1` to request GPU column statistics, parallel-row
-detection, and cone-aware row activity. These passes share one resident device
-workspace. A non-CUDA build or CUDA runtime failure
-falls back to the corresponding CPU pass; sparse event-driven propagation and
-all final reduction commits remain on CPU. CUDA 11.2 or newer is required for
-the asynchronous allocation pool. `prefos_gpu_warmup()` can initialize the
-primary context before a timed solve, while `prefos_gpu_release_cache()` trims
-cached device allocations when no presolve call is active.
+detection, cone-aware row activity, profitable `A` compaction, resident CSC
+construction, singleton-column candidate selection, and parallel-column hash
+sorting. These passes share one resident device workspace. A non-CUDA build or
+CUDA runtime failure falls back to the corresponding CPU pass; sparse
+event-driven propagation and all exact reduction decisions remain on CPU. CUDA
+11.2 or newer is required for the asynchronous allocation pool.
+`prefos_gpu_warmup()` can initialize the primary context before a timed solve,
+while `prefos_gpu_release_cache()` trims cached device allocations when no
+presolve call is active.
 
 The public C API is defined in `include/PreFOS/PreFOS.h`. Installed CMake
 packages expose the `PreFOS::PreFOS` target:

@@ -44,6 +44,29 @@ struct PreFOSCudaWorkspace
     int *column_to_cone;
     int *column_to_cone_position;
 
+    int csc_ready;
+    size_t csc_nnz;
+    int *csc_column_pointers;
+    int *csc_row_indices;
+    double *csc_values;
+
+    size_t affine_rows;
+    size_t affine_nnz;
+    size_t n_affine_cones;
+    int *affine_row_pointers;
+    int *affine_column_indices;
+    double *affine_values;
+    double *affine_offsets;
+    int *affine_cone_types;
+    int *affine_cone_starts;
+    int *affine_cone_indices;
+    int *affine_cone_matrix_orders;
+    double *affine_cone_power_alphas;
+    double *affine_lower_bounds;
+    double *affine_upper_bounds;
+    double *affine_lower_candidates;
+    double *affine_upper_candidates;
+
     int cone_activity_groups_ready;
     size_t n_cone_activity_groups;
     uint64_t *cone_activity_group_keys;

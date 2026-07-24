@@ -42,13 +42,12 @@ PreFOSStatus prefos_internal_reduce_parallel_columns(PreFOSPresolver *presolver)
     prefos_internal_timer_now(&start);
     status = prefos_internal_build_column_workspace(presolver, &workspace);
     if (status == PREFOS_STATUS_OK)
-    {
         status = prefos_internal_reduce_singleton_columns(
             presolver, &workspace, 1);
-        prefos_internal_free_column_workspace(&workspace);
-    }
     if (status == PREFOS_STATUS_OK)
-        status = prefos_internal_reduce_parallel_column_groups(presolver);
+        status = prefos_internal_reduce_parallel_column_groups(
+            presolver, &workspace);
+    prefos_internal_free_column_workspace(&workspace);
     prefos_internal_timer_now(&stop);
     presolver->stats.structural_reduction_milliseconds +=
         prefos_internal_timer_elapsed_milliseconds(&start, &stop);

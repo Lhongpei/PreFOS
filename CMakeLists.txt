@@ -78,9 +78,13 @@ set(PREFOS_SOURCES
 
 if(PREFOS_ENABLE_CUDA)
   list(APPEND PREFOS_SOURCES
+    src/prefos/explorers/PREFOS_CudaAffineConePropagation.cu
+    src/prefos/explorers/PREFOS_CudaColumnWorkspace.cu
     src/prefos/explorers/PREFOS_CudaConeActivity.cu
     src/prefos/explorers/PREFOS_CudaConePropagation.cu
     src/prefos/explorers/PREFOS_CudaLinearPropagation.cu
+    src/prefos/explorers/PREFOS_CudaMatrixCompaction.cu
+    src/prefos/explorers/PREFOS_CudaParallelColumns.cu
     src/prefos/explorers/PREFOS_CudaParallelRows.cu
   )
 else()

@@ -20,16 +20,20 @@ typedef struct
     int *gpu_degrees;
     unsigned char *gpu_down_locked;
     unsigned char *gpu_up_locked;
+    int *gpu_singleton_candidates;
     double *objective;
     int gpu_stats_valid;
+    int gpu_csc_valid;
+    int gpu_singleton_candidates_valid;
     size_t nnz;
+    size_t n_gpu_singleton_candidates;
 } PreFOSColumnWorkspace;
 
 PREFOS_INTERNAL void
 prefos_internal_free_column_workspace(PreFOSColumnWorkspace *workspace);
 
 PREFOS_INTERNAL PreFOSStatus prefos_internal_build_column_workspace(
-    const PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
 
 PREFOS_INTERNAL PreFOSStatus prefos_internal_populate_gpu_column_stats(
     PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
@@ -66,6 +70,7 @@ PREFOS_INTERNAL PreFOSStatus prefos_internal_reduce_bounded_doubletons(
     PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
 
 PREFOS_INTERNAL PreFOSStatus
-prefos_internal_reduce_parallel_column_groups(PreFOSPresolver *presolver);
+prefos_internal_reduce_parallel_column_groups(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace);
 
 #endif

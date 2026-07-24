@@ -51,6 +51,7 @@ static int test_fixed_variable_and_objective_update(void)
     PreFOSConeBlock cone = {PREFOS_CONE_SECOND_ORDER, 2, 0, cone_indices};
 
     PreFOSProblemData problem;
+    PreFOSSettings settings = prefos_default_settings();
     PreFOSPresolver *presolver = NULL;
     const PreFOSPresolvedProblem *reduced;
     const PreFOSStats *stats;
@@ -77,7 +78,8 @@ static int test_fixed_variable_and_objective_update(void)
     problem.n_cones = 1;
     problem.cones = &cone;
 
-    status = prefos_create_presolver(&problem, NULL, &presolver);
+    settings.structural_reductions_gpu = 1;
+    status = prefos_create_presolver(&problem, &settings, &presolver);
     CHECK(status == PREFOS_STATUS_OK);
     CHECK(presolver != NULL);
     status = prefos_run_presolve(presolver);
@@ -104,6 +106,10 @@ static int test_fixed_variable_and_objective_update(void)
     CHECK(reduced->cones[0].indices[1] == 1);
     CHECK(stats->fixed_box_variables == 1);
     CHECK(stats->removed_empty_rows == 1);
+    if (prefos_gpu_warmup_ready())
+        CHECK(stats->matrix_compaction_gpu_passes > 0);
+    else
+        CHECK(stats->matrix_compaction_gpu_fallbacks > 0);
 
     status = prefos_postsolve_primal(presolver, reduced_x, original_x);
     CHECK(status == PREFOS_STATUS_OK);
@@ -1020,6 +1026,7 @@ static int test_affine_cone_propagation(void)
     double h[] = {1.0, 0.0};
     PreFOSAffineConeBlock affine_cone = {PREFOS_CONE_SECOND_ORDER, 2, 0, 0.0};
     PreFOSProblemData problem;
+    PreFOSSettings settings = prefos_default_settings();
     PreFOSPresolver *presolver = NULL;
     const PreFOSPresolvedProblem *reduced;
     const PreFOSStats *stats;
@@ -1041,7 +1048,9 @@ static int test_affine_cone_propagation(void)
     problem.n_affine_cones = 1;
     problem.affine_cones = &affine_cone;
 
-    CHECK(prefos_create_presolver(&problem, NULL, &presolver) == PREFOS_STATUS_OK);
+    settings.linear_propagation_gpu = 1;
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_OK);
     reduced = prefos_get_reduced_problem(presolver);
     stats = prefos_get_stats(presolver);
@@ -1050,11 +1059,91 @@ static int test_affine_cone_propagation(void)
     CHECK(stats->tightened_affine_cone_envelopes >= 2);
     CHECK(stats->tightened_affine_variable_envelopes == 2);
     CHECK(stats->affine_cone_propagation_rounds == 2);
+    if (prefos_gpu_warmup_ready())
+        CHECK(stats->affine_cone_gpu_rounds > 0);
+    else
+        CHECK(stats->affine_cone_gpu_fallbacks > 0);
     prefos_free_presolver(presolver);
 
     box_lower[0] = 2.0;
-    CHECK(prefos_create_presolver(&problem, NULL, &presolver) == PREFOS_STATUS_OK);
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_PRIMAL_INFEASIBLE);
+    prefos_free_presolver(presolver);
+    return 0;
+}
+
+static int test_mixed_affine_cone_gpu_propagation(void)
+{
+    enum
+    {
+        n = 11
+    };
+    int A_rows[] = {0};
+    int Q_rows[n + 1];
+    int R_rows[] = {0};
+    double c[n];
+    int box_indices[n];
+    double box_lower[] = {
+        0.0, -4.0, 0.0, 0.0, -10.0, -1.0, 1.0, 1.0, 1.0, 1.0, -2.0};
+    double box_upper[] = {
+        2.0, 4.0, 2.0, 3.0, 10.0, 0.0, 2.0, 4.0, 2.0, 2.0, 2.0};
+    double G_values[n];
+    int G_columns[n];
+    int G_rows[n + 1];
+    double h[n];
+    PreFOSAffineConeBlock affine_cones[] = {
+        {PREFOS_CONE_SECOND_ORDER, 2, 0, 0.0},
+        {PREFOS_CONE_ROTATED_SECOND_ORDER, 3, 0, 0.0},
+        {PREFOS_CONE_EXPONENTIAL, 3, 0, 0.0},
+        {PREFOS_CONE_POWER, 3, 0, 0.4}};
+    PreFOSProblemData problem;
+    PreFOSSettings settings = prefos_default_settings();
+    PreFOSPresolver *presolver = NULL;
+    const PreFOSStats *stats;
+    int i;
+
+    memset(&problem, 0, sizeof(problem));
+    memset(Q_rows, 0, sizeof(Q_rows));
+    memset(c, 0, sizeof(c));
+    memset(h, 0, sizeof(h));
+    for (i = 0; i < n; ++i)
+    {
+        box_indices[i] = i;
+        G_values[i] = 1.0;
+        G_columns[i] = i;
+        G_rows[i] = i;
+    }
+    G_rows[n] = n;
+    problem.n = n;
+    problem.A = (PreFOSCsrMatrix){0, n, 0, NULL, NULL, A_rows};
+    problem.Q = (PreFOSCsrMatrix){n, n, 0, NULL, NULL, Q_rows};
+    problem.q_storage = PREFOS_Q_UPPER_TRIANGULAR;
+    problem.R = (PreFOSCsrMatrix){0, n, 0, NULL, NULL, R_rows};
+    problem.c = c;
+    problem.n_box = n;
+    problem.box_indices = box_indices;
+    problem.box_lower = box_lower;
+    problem.box_upper = box_upper;
+    problem.affine_cone_matrix =
+        (PreFOSCsrMatrix){n, n, n, G_values, G_columns, G_rows};
+    problem.affine_cone_offset = h;
+    problem.n_affine_cones =
+        sizeof(affine_cones) / sizeof(affine_cones[0]);
+    problem.affine_cones = affine_cones;
+
+    settings.linear_propagation_gpu = 1;
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
+    CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_OK);
+    stats = prefos_get_stats(presolver);
+    CHECK(stats != NULL);
+    CHECK(stats->affine_cones_processed >= 4);
+    CHECK(stats->tightened_affine_variable_envelopes >= 4);
+    if (prefos_gpu_warmup_ready())
+        CHECK(stats->affine_cone_gpu_rounds > 0);
+    else
+        CHECK(stats->affine_cone_gpu_fallbacks > 0);
     prefos_free_presolver(presolver);
     return 0;
 }
@@ -4686,6 +4775,7 @@ int main(void)
     if (test_affine_cone_input_passthrough()) return 1;
     if (test_affine_aggregation_full_dual()) return 1;
     if (test_affine_cone_propagation()) return 1;
+    if (test_mixed_affine_cone_gpu_propagation()) return 1;
     if (test_affine_singleton_bound_certificate()) return 1;
     if (test_generated_affine_singleton_bound_certificate()) return 1;
     if (test_input_affine_structural_faces()) return 1;

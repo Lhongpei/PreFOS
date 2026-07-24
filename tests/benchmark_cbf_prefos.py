@@ -210,6 +210,16 @@ class PreFOSStats(ct.Structure):
         ("structural_gpu_passes", ct.c_size_t),
         ("structural_gpu_fallbacks", ct.c_size_t),
         ("structural_reduction_milliseconds", ct.c_double),
+        ("column_csc_gpu_builds", ct.c_size_t),
+        ("column_csc_gpu_fallbacks", ct.c_size_t),
+        ("column_csc_gpu_milliseconds", ct.c_double),
+        ("singleton_column_gpu_passes", ct.c_size_t),
+        ("singleton_column_gpu_fallbacks", ct.c_size_t),
+        ("singleton_column_gpu_candidates", ct.c_size_t),
+        ("singleton_column_gpu_milliseconds", ct.c_double),
+        ("parallel_column_gpu_passes", ct.c_size_t),
+        ("parallel_column_gpu_fallbacks", ct.c_size_t),
+        ("parallel_column_gpu_milliseconds", ct.c_double),
         ("parallel_row_gpu_passes", ct.c_size_t),
         ("parallel_row_gpu_fallbacks", ct.c_size_t),
         ("cone_activity_gpu_passes", ct.c_size_t),
@@ -224,6 +234,12 @@ class PreFOSStats(ct.Structure):
         ("cone_gpu_milliseconds", ct.c_double),
         ("cone_gpu_linear_transfer_milliseconds", ct.c_double),
         ("cone_gpu_linear_kernel_milliseconds", ct.c_double),
+        ("affine_cone_gpu_rounds", ct.c_size_t),
+        ("affine_cone_gpu_fallbacks", ct.c_size_t),
+        ("affine_cone_gpu_milliseconds", ct.c_double),
+        ("matrix_compaction_gpu_passes", ct.c_size_t),
+        ("matrix_compaction_gpu_fallbacks", ct.c_size_t),
+        ("matrix_compaction_gpu_milliseconds", ct.c_double),
     ]
 
 
@@ -538,6 +554,12 @@ def print_summary(result):
         f"long_rows:{result['linear_gpu_long_rows']} "
         f"gpu-struct=workspace:"
         f"{result['cuda_workspace_setup_milliseconds']:.1f}ms,"
+        f"csc:{result['column_csc_gpu_builds']}/"
+        f"{result['column_csc_gpu_milliseconds']:.1f}ms,"
+        f"singleton-col:{result['singleton_column_gpu_passes']}/"
+        f"{result['singleton_column_gpu_milliseconds']:.1f}ms,"
+        f"parallel-col:{result['parallel_column_gpu_passes']}/"
+        f"{result['parallel_column_gpu_milliseconds']:.1f}ms,"
         f"parallel:{result['parallel_row_gpu_passes']}/"
         f"{result['parallel_row_gpu_milliseconds']:.1f}ms,"
         f"activity:{result['cone_activity_gpu_passes']}/"
@@ -545,7 +567,11 @@ def print_summary(result):
         f"cone:{result['cone_gpu_rounds']}/"
         f"{result['cone_gpu_milliseconds']:.1f}ms,"
         f"cone-linear:{result['cone_gpu_linear_rounds']}/"
-        f"{result['cone_gpu_linear_kernel_milliseconds']:.1f}ms "
+        f"{result['cone_gpu_linear_kernel_milliseconds']:.1f}ms,"
+        f"affine:{result['affine_cone_gpu_rounds']}/"
+        f"{result['affine_cone_gpu_milliseconds']:.1f}ms,"
+        f"compact:{result['matrix_compaction_gpu_passes']}/"
+        f"{result['matrix_compaction_gpu_milliseconds']:.1f}ms "
         f"rss={result['rss_after_presolve_mib']:.1f}MiB"
     )
 

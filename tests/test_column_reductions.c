@@ -168,20 +168,32 @@ static int test_singleton_column_substitution(void)
     double reduced_x[] = {2.0};
     double original_x[2];
     PreFOSProblemData problem;
+    PreFOSSettings settings = prefos_strict_settings();
     PreFOSPresolver *presolver = NULL;
     const PreFOSPresolvedProblem *reduced;
+    const PreFOSStats *stats;
     PreFOSPrimalVerification verification;
+    int gpu_available = prefos_gpu_warmup();
 
+    settings.structural_reductions_gpu = 1;
     init_linear_problem(&problem, 2, 1, 2, A_values, A_columns, A_rows,
                         row_side, row_side, Q_rows, R_rows, c, box_indices,
                         box_lower, box_upper);
-    CHECK(prefos_create_presolver(&problem, NULL, &presolver) == PREFOS_STATUS_OK);
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
     CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
     reduced = prefos_get_reduced_problem(presolver);
+    stats = prefos_get_stats(presolver);
     CHECK(reduced->n == 1 && reduced->A.rows == 0);
     CHECK(close_to(reduced->objective_offset, 2.0));
     CHECK(close_to(reduced->c[0], -1.0));
-    CHECK(prefos_get_stats(presolver)->removed_singleton_columns == 1);
+    CHECK(stats->removed_singleton_columns == 1);
+    CHECK(gpu_available ? stats->column_csc_gpu_builds > 0
+                        : stats->column_csc_gpu_fallbacks > 0);
+    CHECK(gpu_available ? stats->singleton_column_gpu_passes > 0
+                        : stats->singleton_column_gpu_fallbacks > 0);
+    if (gpu_available)
+        CHECK(stats->singleton_column_gpu_candidates > 0);
     CHECK(prefos_postsolve_primal(presolver, reduced_x, original_x) ==
           PREFOS_STATUS_OK);
     CHECK(close_to(original_x[0], 0.0) && close_to(original_x[1], 2.0));
@@ -189,6 +201,7 @@ static int test_singleton_column_substitution(void)
                                          &verification) == PREFOS_STATUS_OK);
     CHECK(verification.passed);
     prefos_free_presolver(presolver);
+    prefos_gpu_release_cache();
     return 0;
 }
 
@@ -536,6 +549,7 @@ static PreFOSSettings parallel_only_settings(void)
 
 static int test_parallel_column_reductions(void)
 {
+    int gpu_available = prefos_gpu_warmup();
     {
         double A_values[] = {1, -1, 1, 1, 1, 2, 2, -1};
         int A_columns[] = {0, 1, 1, 2, 3, 1, 2, 3};
@@ -594,6 +608,7 @@ static int test_parallel_column_reductions(void)
         const PreFOSPresolvedProblem *reduced;
         PreFOSPrimalVerification verification;
 
+        settings.structural_reductions_gpu = 1;
         init_linear_problem(&problem, 4, 2, 8, A_values, A_columns, A_rows,
                             row_lower, row_upper, Q_rows, R_rows, c, box_indices,
                             box_lower, box_upper);
@@ -603,6 +618,10 @@ static int test_parallel_column_reductions(void)
         reduced = prefos_get_reduced_problem(presolver);
         CHECK(reduced->n == 2 && reduced->A.nnz == 4);
         CHECK(prefos_get_stats(presolver)->merged_parallel_columns == 2);
+        CHECK(gpu_available
+                  ? prefos_get_stats(presolver)->parallel_column_gpu_passes > 0
+                  : prefos_get_stats(presolver)
+                            ->parallel_column_gpu_fallbacks > 0);
         CHECK(close_to(reduced->box_lower[0], -3.0));
         CHECK(close_to(reduced->box_upper[0], 3.0));
         CHECK(prefos_postsolve_primal(presolver, reduced_x, original_x) ==
@@ -667,6 +686,7 @@ static int test_parallel_column_reductions(void)
         CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_PRIMAL_UNBOUNDED);
         prefos_free_presolver(presolver);
     }
+    prefos_gpu_release_cache();
     return 0;
 }
 

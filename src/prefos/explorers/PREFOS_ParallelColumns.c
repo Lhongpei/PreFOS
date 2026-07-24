@@ -4,6 +4,8 @@
  */
 
 #include "PREFOS_ColumnReductionInternal.h"
+#include "PREFOS_CudaBackend.h"
+#include "PREFOS_CudaLinearPropagation.h"
 #include "ParallelRowDetection.h"
 
 typedef struct
@@ -68,20 +70,20 @@ static PreFOSStatus append_parallel_record(PreFOSPresolver *presolver,
 }
 
 PreFOSStatus
-prefos_internal_reduce_parallel_column_groups(PreFOSPresolver *presolver)
+prefos_internal_reduce_parallel_column_groups(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
 {
-    PreFOSColumnWorkspace workspace;
     PreFOSParallelColumnContext context;
     PresolveSparseRowView view;
     int *parallel = NULL, *support_hashes = NULL, *coefficient_hashes = NULL;
     int *sort_auxiliary = NULL, *group_starts = NULL;
+    unsigned char *gpu_eligible = NULL;
     size_t n_groups = 0, group;
-    PreFOSStatus status;
+    PreFOSStatus status = PREFOS_STATUS_OK;
+    int detected = 0;
     if (!presolver->settings.parallel_column_reduction ||
         presolver->original.n < 2)
         return PREFOS_STATUS_OK;
-    status = prefos_internal_build_column_workspace(presolver, &workspace);
-    if (status != PREFOS_STATUS_OK) return status;
     {
         size_t row;
         for (row = 0; row < presolver->original.A.rows; ++row)
@@ -95,7 +97,7 @@ prefos_internal_reduce_parallel_column_groups(PreFOSPresolver *presolver)
                 if (presolver->is_substituted[column] ||
                     presolver->is_parallel_removed[column])
                 {
-                    workspace.dirty_row[row] = 1;
+                    workspace->dirty_row[row] = 1;
                     break;
                 }
             }
@@ -118,19 +120,68 @@ prefos_internal_reduce_parallel_column_groups(PreFOSPresolver *presolver)
         goto cleanup;
     }
     context.presolver = presolver;
-    context.workspace = &workspace;
+    context.workspace = workspace;
     view = (PresolveSparseRowView){presolver->original.n,
-                                  workspace.values,
-                                  workspace.rows,
-                                  workspace.starts,
-                                  workspace.starts + 1,
+                                  workspace->values,
+                                  workspace->rows,
+                                  workspace->starts,
+                                  workspace->starts + 1,
                                   1};
-    if (!presolve_find_parallel_rows(
+    if (presolver->settings.structural_reductions_gpu)
+    {
+        PreFOSCudaPropagationStatus cuda_status =
+            PREFOS_CUDA_PROPAGATION_UNAVAILABLE;
+        PreFOSCudaWorkspace *cuda_workspace = NULL;
+        size_t active_columns = 0, column;
+        double gpu_milliseconds = 0.0;
+        gpu_eligible = (unsigned char *) prefos_internal_alloc_array(
+            presolver->original.n, sizeof(unsigned char));
+        if (presolver->original.n > 0 && !gpu_eligible)
+        {
+            status = PREFOS_STATUS_OUT_OF_MEMORY;
+            goto cleanup;
+        }
+        for (column = 0; column < presolver->original.n; ++column)
+            gpu_eligible[column] = (unsigned char)
+                (prefos_internal_column_is_linear_box(
+                     presolver, workspace, (int) column) &&
+                 !workspace->protected_target[column]);
+        if (workspace->gpu_csc_valid)
+        {
+            cuda_workspace =
+                prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+            if (cuda_workspace &&
+                cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+                cuda_status = prefos_cuda_parallel_column_hash_sort(
+                    cuda_workspace, gpu_eligible, workspace->dirty_row,
+                    parallel, support_hashes, coefficient_hashes,
+                    &active_columns, &gpu_milliseconds);
+        }
+        presolver->stats.parallel_column_gpu_milliseconds +=
+            gpu_milliseconds;
+        if (cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+        {
+            detected = presolve_collect_parallel_row_groups(
+                &view, presolver->settings.feasibility_tolerance,
+                parallel, active_columns, support_hashes,
+                coefficient_hashes, group_starts,
+                presolver->original.n + 1, &n_groups);
+            if (detected)
+                ++presolver->stats.parallel_column_gpu_passes;
+        }
+        if (!detected)
+            ++presolver->stats.parallel_column_gpu_fallbacks;
+    }
+    if (!detected)
+    {
+        detected = presolve_find_parallel_rows(
             &view, parallel_column_is_active, &context,
             presolver->settings.feasibility_tolerance,
             presolve_sort_rows_by_hash, parallel, support_hashes,
             coefficient_hashes, sort_auxiliary, group_starts,
-            presolver->original.n + 1, &n_groups))
+            presolver->original.n + 1, &n_groups);
+    }
+    if (!detected)
     {
         status = PREFOS_STATUS_NUMERICAL_ERROR;
         goto cleanup;
@@ -149,11 +200,11 @@ prefos_internal_reduce_parallel_column_groups(PreFOSPresolver *presolver)
             double source_lower, source_upper, target_lower, target_upper;
             double new_lower, new_upper;
             if (!parallel_column_is_active(&context, (size_t) source)) continue;
-            ratio = workspace.values[workspace.starts[source]] /
-                    workspace.values[workspace.starts[target]];
+            ratio = workspace->values[workspace->starts[source]] /
+                    workspace->values[workspace->starts[target]];
             if (!isfinite(ratio) || ratio == 0.0) continue;
-            objective_gap = workspace.objective[source] -
-                            ratio * workspace.objective[target];
+            objective_gap = workspace->objective[source] -
+                            ratio * workspace->objective[target];
             source_box = presolver->variable_to_box[source];
             target_box = presolver->variable_to_box[target];
             source_lower = presolver->working_box_lower[source_box];
@@ -229,8 +280,8 @@ prefos_internal_reduce_parallel_column_groups(PreFOSPresolver *presolver)
             presolver->propagation_upper[target] = new_upper;
             presolver->is_parallel_removed[source] = 1;
             presolver->variable_to_box[source] = -1;
-            workspace.protected_target[source] = 1;
-            workspace.protected_target[target] = 1;
+            workspace->protected_target[source] = 1;
+            workspace->protected_target[target] = 1;
             ++presolver->stats.merged_parallel_columns;
             ++presolver->n_parallel_column_reductions;
         }
@@ -242,6 +293,6 @@ cleanup:
     free(coefficient_hashes);
     free(sort_auxiliary);
     free(group_starts);
-    prefos_internal_free_column_workspace(&workspace);
+    free(gpu_eligible);
     return status;
 }

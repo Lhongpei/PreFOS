@@ -4,6 +4,66 @@
  */
 
 #include "PREFOS_ColumnReductionInternal.h"
+#include "PREFOS_CudaBackend.h"
+#include "PREFOS_CudaLinearPropagation.h"
+
+static PreFOSStatus populate_gpu_singleton_candidates(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+{
+    const PreFOSProblemData *problem = &presolver->original;
+    unsigned char *eligible = NULL;
+    PreFOSCudaPropagationStatus cuda_status =
+        PREFOS_CUDA_PROPAGATION_UNAVAILABLE;
+    PreFOSCudaWorkspace *cuda_workspace = NULL;
+    double milliseconds = 0.0;
+    size_t column;
+
+    workspace->gpu_singleton_candidates_valid = 0;
+    workspace->n_gpu_singleton_candidates = 0;
+    if (!presolver->settings.structural_reductions_gpu)
+        return PREFOS_STATUS_OK;
+    workspace->gpu_singleton_candidates = (int *)
+        prefos_internal_alloc_array(problem->n, sizeof(int));
+    eligible = (unsigned char *)
+        prefos_internal_alloc_array(problem->n, sizeof(unsigned char));
+    if (problem->n > 0 &&
+        (!workspace->gpu_singleton_candidates || !eligible))
+    {
+        free(eligible);
+        return PREFOS_STATUS_OUT_OF_MEMORY;
+    }
+    for (column = 0; column < problem->n; ++column)
+        eligible[column] = (unsigned char)
+            (prefos_internal_column_is_linear_box(
+                 presolver, workspace, (int) column) &&
+             !workspace->protected_target[column]);
+    if (workspace->gpu_csc_valid)
+    {
+        cuda_workspace =
+            prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+        if (cuda_workspace && cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+            cuda_status = prefos_cuda_singleton_column_candidates(
+                cuda_workspace, eligible, workspace->dirty_row,
+                workspace->gpu_singleton_candidates,
+                &workspace->n_gpu_singleton_candidates, &milliseconds);
+    }
+    free(eligible);
+    presolver->stats.singleton_column_gpu_milliseconds += milliseconds;
+    if (cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+    {
+        workspace->gpu_singleton_candidates_valid = 1;
+        ++presolver->stats.singleton_column_gpu_passes;
+        presolver->stats.singleton_column_gpu_candidates +=
+            workspace->n_gpu_singleton_candidates;
+    }
+    else
+    {
+        free(workspace->gpu_singleton_candidates);
+        workspace->gpu_singleton_candidates = NULL;
+        ++presolver->stats.singleton_column_gpu_fallbacks;
+    }
+    return PREFOS_STATUS_OK;
+}
 
 static int singleton_bounds_are_implied(
     const PreFOSPresolver *presolver, size_t row, int pivot_column,
@@ -107,11 +167,22 @@ PreFOSStatus prefos_internal_reduce_singleton_columns(
     int allow_one_sided)
 {
     const PreFOSProblemData *problem = &presolver->original;
-    size_t column;
+    size_t candidate, candidate_count;
+    PreFOSStatus candidate_status;
     if (!presolver->settings.singleton_column_reduction)
         return PREFOS_STATUS_OK;
-    for (column = 0; column < problem->n; ++column)
+    candidate_status =
+        populate_gpu_singleton_candidates(presolver, workspace);
+    if (candidate_status != PREFOS_STATUS_OK) return candidate_status;
+    candidate_count = workspace->gpu_singleton_candidates_valid
+                          ? workspace->n_gpu_singleton_candidates
+                          : problem->n;
+    for (candidate = 0; candidate < candidate_count; ++candidate)
     {
+        size_t column = workspace->gpu_singleton_candidates_valid
+                            ? (size_t)
+                                  workspace->gpu_singleton_candidates[candidate]
+                            : candidate;
         int row, p, free_below = 0, free_above = 0;
         int targets[PREFOS_MAX_AGGREGATION_TERMS];
         double scales[PREFOS_MAX_AGGREGATION_TERMS];

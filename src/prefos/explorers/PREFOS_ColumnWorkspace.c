@@ -20,40 +20,21 @@ void prefos_internal_free_column_workspace(PreFOSColumnWorkspace *workspace)
     free(workspace->gpu_degrees);
     free(workspace->gpu_down_locked);
     free(workspace->gpu_up_locked);
+    free(workspace->gpu_singleton_candidates);
     free(workspace->objective);
     memset(workspace, 0, sizeof(*workspace));
 }
 
-PreFOSStatus prefos_internal_build_column_workspace(
+static PreFOSStatus build_column_csc_cpu(
     const PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
 {
     const PreFOSProblemData *problem = &presolver->original;
-    int *cursor = NULL;
+    int *cursor;
     size_t row, position;
 
-    memset(workspace, 0, sizeof(*workspace));
-    workspace->starts = (int *) calloc(problem->n + 1, sizeof(int));
-    workspace->quadratic =
-        (unsigned char *) calloc(problem->n, sizeof(unsigned char));
-    workspace->factor =
-        (unsigned char *) calloc(problem->n, sizeof(unsigned char));
-    workspace->protected_target =
-        (unsigned char *) calloc(problem->n, sizeof(unsigned char));
-    workspace->dirty_row =
-        (unsigned char *) calloc(problem->A.rows, sizeof(unsigned char));
-    workspace->objective = (double *) calloc(problem->n, sizeof(double));
     cursor = (int *) prefos_internal_alloc_array(problem->n, sizeof(int));
-    if (!workspace->starts ||
-        (problem->n > 0 && (!workspace->quadratic || !workspace->factor ||
-                            !workspace->protected_target || !workspace->objective ||
-                            !cursor)) ||
-        (problem->A.rows > 0 && !workspace->dirty_row))
-    {
-        free(cursor);
-        prefos_internal_free_column_workspace(workspace);
-        return PREFOS_STATUS_OUT_OF_MEMORY;
-    }
-
+    if (problem->n > 0 && !cursor) return PREFOS_STATUS_OUT_OF_MEMORY;
+    memset(workspace->starts, 0, (problem->n + 1) * sizeof(int));
     for (row = 0; row < problem->A.rows; ++row)
     {
         int p;
@@ -76,7 +57,10 @@ PreFOSStatus prefos_internal_build_column_workspace(
     if (workspace->nnz > 0 && (!workspace->rows || !workspace->values))
     {
         free(cursor);
-        prefos_internal_free_column_workspace(workspace);
+        free(workspace->rows);
+        free(workspace->values);
+        workspace->rows = NULL;
+        workspace->values = NULL;
         return PREFOS_STATUS_OUT_OF_MEMORY;
     }
     if (problem->n > 0)
@@ -97,6 +81,110 @@ PreFOSStatus prefos_internal_build_column_workspace(
         }
     }
     free(cursor);
+    return PREFOS_STATUS_OK;
+}
+
+static PreFOSStatus build_column_csc_gpu(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace,
+    int *used_gpu)
+{
+    const PreFOSProblemData *problem = &presolver->original;
+    PreFOSCudaPropagationStatus cuda_status;
+    PreFOSCudaWorkspace *cuda_workspace;
+    double milliseconds = 0.0, copy_milliseconds = 0.0;
+    size_t active_nnz = 0;
+
+    *used_gpu = 0;
+    if (!presolver->settings.structural_reductions_gpu)
+        return PREFOS_STATUS_OK;
+    cuda_workspace =
+        prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+    if (cuda_workspace && cuda_status == PREFOS_CUDA_PROPAGATION_OK)
+        cuda_status = prefos_cuda_workspace_build_csc(
+            cuda_workspace, presolver->remove_rows, workspace->starts,
+            &active_nnz, &milliseconds);
+    presolver->stats.column_csc_gpu_milliseconds += milliseconds;
+    if (!cuda_workspace || cuda_status != PREFOS_CUDA_PROPAGATION_OK)
+    {
+        ++presolver->stats.column_csc_gpu_fallbacks;
+        return PREFOS_STATUS_OK;
+    }
+    workspace->rows =
+        (int *) prefos_internal_alloc_array(active_nnz, sizeof(int));
+    workspace->values =
+        (double *) prefos_internal_alloc_array(active_nnz, sizeof(double));
+    if (active_nnz > 0 && (!workspace->rows || !workspace->values))
+    {
+        free(workspace->rows);
+        free(workspace->values);
+        workspace->rows = NULL;
+        workspace->values = NULL;
+        return PREFOS_STATUS_OUT_OF_MEMORY;
+    }
+    cuda_status = prefos_cuda_workspace_copy_csc(
+        cuda_workspace, workspace->rows, workspace->values,
+        &copy_milliseconds);
+    presolver->stats.column_csc_gpu_milliseconds += copy_milliseconds;
+    if (cuda_status != PREFOS_CUDA_PROPAGATION_OK)
+    {
+        free(workspace->rows);
+        free(workspace->values);
+        workspace->rows = NULL;
+        workspace->values = NULL;
+        memset(workspace->starts, 0, (problem->n + 1) * sizeof(int));
+        ++presolver->stats.column_csc_gpu_fallbacks;
+        return PREFOS_STATUS_OK;
+    }
+    workspace->nnz = active_nnz;
+    workspace->gpu_csc_valid = 1;
+    ++presolver->stats.column_csc_gpu_builds;
+    *used_gpu = 1;
+    return PREFOS_STATUS_OK;
+}
+
+PreFOSStatus prefos_internal_build_column_workspace(
+    PreFOSPresolver *presolver, PreFOSColumnWorkspace *workspace)
+{
+    const PreFOSProblemData *problem = &presolver->original;
+    size_t row;
+    int used_gpu = 0;
+    PreFOSStatus status;
+
+    memset(workspace, 0, sizeof(*workspace));
+    workspace->starts = (int *) calloc(problem->n + 1, sizeof(int));
+    workspace->quadratic =
+        (unsigned char *) calloc(problem->n, sizeof(unsigned char));
+    workspace->factor =
+        (unsigned char *) calloc(problem->n, sizeof(unsigned char));
+    workspace->protected_target =
+        (unsigned char *) calloc(problem->n, sizeof(unsigned char));
+    workspace->dirty_row =
+        (unsigned char *) calloc(problem->A.rows, sizeof(unsigned char));
+    workspace->objective = (double *) calloc(problem->n, sizeof(double));
+    if (!workspace->starts ||
+        (problem->n > 0 &&
+         (!workspace->quadratic || !workspace->factor ||
+          !workspace->protected_target || !workspace->objective)) ||
+        (problem->A.rows > 0 && !workspace->dirty_row))
+    {
+        prefos_internal_free_column_workspace(workspace);
+        return PREFOS_STATUS_OUT_OF_MEMORY;
+    }
+    status = build_column_csc_gpu(presolver, workspace, &used_gpu);
+    if (status != PREFOS_STATUS_OK)
+    {
+        prefos_internal_free_column_workspace(workspace);
+        return status;
+    }
+    if (!used_gpu)
+    {
+        status = build_column_csc_cpu(presolver, workspace);
+        if (status != PREFOS_STATUS_OK)
+        {
+            prefos_internal_free_column_workspace(workspace);
+            return status;
+        }
+    }
 
     for (row = 0; row < problem->Q.rows; ++row)
     {

@@ -170,7 +170,7 @@ extern "C"
         double max_aggregation_scale;
         int linear_propagation;
         int max_linear_propagation_rounds;
-        /* Experimental CUDA bulk backend; ignored by builds without CUDA. */
+        /* CUDA bulk linear and cone propagation; ignored without CUDA. */
         int linear_propagation_gpu;
         /* Zero work ratio or zero stale rounds disables that adaptive limit. */
         double linear_propagation_max_work_ratio;
@@ -213,7 +213,7 @@ extern "C"
         int parallel_column_reduction;
         /* Remove row-implied box sides in the interior-point bound policy. */
         int remove_redundant_bounds;
-        /* Use CUDA for structural statistics and row candidate detection. */
+        /* Use CUDA for structural passes and profitable A compaction. */
         int structural_reductions_gpu;
         /*
          * Skip parallel-row detection above this average input row width.
@@ -387,6 +387,16 @@ extern "C"
         size_t structural_gpu_passes;
         size_t structural_gpu_fallbacks;
         double structural_reduction_milliseconds;
+        size_t column_csc_gpu_builds;
+        size_t column_csc_gpu_fallbacks;
+        double column_csc_gpu_milliseconds;
+        size_t singleton_column_gpu_passes;
+        size_t singleton_column_gpu_fallbacks;
+        size_t singleton_column_gpu_candidates;
+        double singleton_column_gpu_milliseconds;
+        size_t parallel_column_gpu_passes;
+        size_t parallel_column_gpu_fallbacks;
+        double parallel_column_gpu_milliseconds;
         size_t parallel_row_gpu_passes;
         size_t parallel_row_gpu_fallbacks;
         size_t cone_activity_gpu_passes;
@@ -401,6 +411,12 @@ extern "C"
         double cone_gpu_milliseconds;
         double cone_gpu_linear_transfer_milliseconds;
         double cone_gpu_linear_kernel_milliseconds;
+        size_t affine_cone_gpu_rounds;
+        size_t affine_cone_gpu_fallbacks;
+        double affine_cone_gpu_milliseconds;
+        size_t matrix_compaction_gpu_passes;
+        size_t matrix_compaction_gpu_fallbacks;
+        double matrix_compaction_gpu_milliseconds;
     } PreFOSStats;
 
     typedef struct

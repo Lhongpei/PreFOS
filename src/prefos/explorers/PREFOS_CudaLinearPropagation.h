@@ -49,6 +49,34 @@ extern "C"
         int *column_degrees, unsigned char *down_locked,
         unsigned char *up_locked, double *milliseconds);
 
+    PreFOSCudaPropagationStatus prefos_cuda_workspace_build_csc(
+        PreFOSCudaWorkspace *context, const unsigned char *remove_rows,
+        int *column_pointers, size_t *active_nnz, double *milliseconds);
+
+    PreFOSCudaPropagationStatus prefos_cuda_workspace_copy_csc(
+        PreFOSCudaWorkspace *context, int *row_indices, double *values,
+        double *milliseconds);
+
+    PreFOSCudaPropagationStatus prefos_cuda_singleton_column_candidates(
+        PreFOSCudaWorkspace *context,
+        const unsigned char *eligible_columns,
+        const unsigned char *dirty_rows, int *candidate_columns,
+        size_t *candidate_count, double *milliseconds);
+
+    PreFOSCudaPropagationStatus prefos_cuda_parallel_column_hash_sort(
+        PreFOSCudaWorkspace *context,
+        const unsigned char *eligible_columns,
+        const unsigned char *dirty_rows, int *sorted_columns,
+        int *support_hashes, int *coefficient_hashes,
+        size_t *active_columns, double *milliseconds);
+
+    PreFOSCudaPropagationStatus prefos_cuda_workspace_attach_affine(
+        PreFOSCudaWorkspace *context, size_t rows, size_t nnz,
+        const int *row_pointers, const int *column_indices,
+        const double *values, const double *offsets, size_t n_cones,
+        const int *cone_types, const int *cone_starts,
+        const int *cone_matrix_orders, const double *cone_power_alphas);
+
     PreFOSCudaPropagationStatus prefos_cuda_parallel_row_hash_sort(
         PreFOSCudaWorkspace *context, const unsigned char *remove_rows,
         int *sorted_rows, int *support_hashes, int *coefficient_hashes,
@@ -82,6 +110,36 @@ extern "C"
         const double *upper_bounds, double feasibility_tolerance,
         double *lower_candidates, double *upper_candidates,
         unsigned char *cone_flags, double *milliseconds);
+
+    PreFOSCudaPropagationStatus prefos_cuda_affine_coordinate_activity(
+        PreFOSCudaWorkspace *context, const double *lower_bounds,
+        const double *upper_bounds, double *coordinate_lower,
+        double *coordinate_upper, double *milliseconds);
+
+    PreFOSCudaPropagationStatus prefos_cuda_affine_cone_envelope_round(
+        PreFOSCudaWorkspace *context, const double *coordinate_lower,
+        const double *coordinate_upper, double feasibility_tolerance,
+        double *lower_candidates, double *upper_candidates,
+        unsigned char *cone_flags, double *milliseconds);
+
+    PreFOSCudaPropagationStatus prefos_cuda_affine_row_propagation(
+        PreFOSCudaWorkspace *context, const double *lower_bounds,
+        const double *upper_bounds, const double *coordinate_lower,
+        const double *coordinate_upper, double maximum_inferred_bound_magnitude,
+        double *lower_candidates, double *upper_candidates,
+        double *milliseconds);
+
+    PreFOSCudaPropagationStatus prefos_cuda_compact_a_analyze(
+        PreFOSCudaWorkspace *context, const unsigned char *remove_rows,
+        const unsigned char *is_fixed, const double *fixed_values,
+        const int *column_map, int *row_nnz, double *row_shifts,
+        unsigned char *row_needs_exact_shift, double *milliseconds);
+
+    PreFOSCudaPropagationStatus prefos_cuda_compact_a_write(
+        PreFOSCudaWorkspace *context, const int *column_map,
+        const int *row_map, const int *output_row_pointers,
+        size_t output_rows, size_t output_nnz, int *output_columns,
+        double *output_values, double *milliseconds);
 
     PreFOSCudaPropagationStatus prefos_cuda_linear_column_stats(
         size_t rows, size_t columns, size_t nnz, const int *row_pointers,

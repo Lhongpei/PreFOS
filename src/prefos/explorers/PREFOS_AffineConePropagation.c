@@ -6,7 +6,10 @@
 #include "PREFOS_AffineConePropagation.h"
 
 #include "PREFOS_ConePropagation.h"
+#include "PREFOS_CudaBackend.h"
+#include "PREFOS_CudaLinearPropagation.h"
 #include "PREFOS_LinearPropagation.h"
+#include "LinearPropagationKernel.h"
 
 typedef struct
 {
@@ -239,7 +242,8 @@ static PreFOSStatus propagate_block(PreFOSPresolver *presolver,
     return PREFOS_STATUS_OK;
 }
 
-PreFOSStatus prefos_internal_propagate_affine_cones(PreFOSPresolver *presolver, int *changed)
+static PreFOSStatus propagate_affine_cones_cpu(PreFOSPresolver *presolver,
+                                               int *changed)
 {
     const PreFOSProblemData *problem = &presolver->original;
     PreFOSAffineEnvelopeRow *rows = NULL;
@@ -356,4 +360,190 @@ cleanup:
     free(upper);
     free(indices);
     return status;
+}
+
+static int has_converted_affine_cones(const PreFOSPresolver *presolver)
+{
+    size_t cone;
+    for (cone = 0; cone < presolver->original.n_cones; ++cone)
+        if (presolver->converted_affine_cones[cone]) return 1;
+    return 0;
+}
+
+static PreFOSStatus propagate_affine_cones_gpu(PreFOSPresolver *presolver,
+                                               int *changed,
+                                               int *used_gpu)
+{
+    const PreFOSProblemData *problem = &presolver->original;
+    PreFOSCudaWorkspace *workspace;
+    PreFOSCudaPropagationStatus cuda_status;
+    double *activity_lower = NULL, *activity_upper = NULL;
+    double *coordinate_lower = NULL, *coordinate_upper = NULL;
+    double *variable_lower = NULL, *variable_upper = NULL;
+    unsigned char *flags = NULL;
+    int *indices = NULL;
+    size_t maximum_dimension = 0, affine_row = 0, cone, coordinate;
+    double milliseconds = 0.0;
+    PreFOSStatus status = PREFOS_STATUS_OK;
+
+    *used_gpu = 0;
+    if (!presolver->settings.linear_propagation_gpu ||
+        problem->n_affine_cones == 0 ||
+        problem->affine_cone_matrix.rows == 0 ||
+        has_converted_affine_cones(presolver))
+        return PREFOS_STATUS_OK;
+    workspace = prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+    if (!workspace || cuda_status != PREFOS_CUDA_PROPAGATION_OK)
+        return PREFOS_STATUS_OK;
+
+    for (cone = 0; cone < problem->n_affine_cones; ++cone)
+        if (problem->affine_cones[cone].dimension > maximum_dimension)
+            maximum_dimension = problem->affine_cones[cone].dimension;
+    activity_lower = (double *) prefos_internal_alloc_array(
+        problem->affine_cone_matrix.rows, sizeof(double));
+    activity_upper = (double *) prefos_internal_alloc_array(
+        problem->affine_cone_matrix.rows, sizeof(double));
+    coordinate_lower = (double *) prefos_internal_alloc_array(
+        problem->affine_cone_matrix.rows, sizeof(double));
+    coordinate_upper = (double *) prefos_internal_alloc_array(
+        problem->affine_cone_matrix.rows, sizeof(double));
+    variable_lower =
+        (double *) prefos_internal_alloc_array(problem->n, sizeof(double));
+    variable_upper =
+        (double *) prefos_internal_alloc_array(problem->n, sizeof(double));
+    flags = (unsigned char *) prefos_internal_alloc_array(
+        problem->n_affine_cones, sizeof(unsigned char));
+    indices =
+        (int *) prefos_internal_alloc_array(maximum_dimension, sizeof(int));
+    if (!activity_lower || !activity_upper || !coordinate_lower ||
+        !coordinate_upper ||
+        (problem->n > 0 && (!variable_lower || !variable_upper)) ||
+        !flags || !indices)
+    {
+        status = PREFOS_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+
+    cuda_status = prefos_cuda_affine_coordinate_activity(
+        workspace, presolver->propagation_lower,
+        presolver->propagation_upper, activity_lower, activity_upper,
+        &milliseconds);
+    presolver->stats.affine_cone_gpu_milliseconds += milliseconds;
+    if (cuda_status != PREFOS_CUDA_PROPAGATION_OK) goto cleanup;
+    milliseconds = 0.0;
+    cuda_status = prefos_cuda_affine_cone_envelope_round(
+        workspace, activity_lower, activity_upper,
+        presolver->settings.feasibility_tolerance, coordinate_lower,
+        coordinate_upper, flags, &milliseconds);
+    presolver->stats.affine_cone_gpu_milliseconds += milliseconds;
+    if (cuda_status != PREFOS_CUDA_PROPAGATION_OK) goto cleanup;
+
+    for (cone = 0; cone < problem->n_affine_cones; ++cone)
+    {
+        const PreFOSAffineConeBlock *block = &problem->affine_cones[cone];
+        int needs_cpu =
+            (flags[cone] &
+             (PREFOS_CUDA_CONE_NEEDS_CPU |
+              PREFOS_CUDA_CONE_INFEASIBLE)) != 0;
+        if (affine_psd_exceeds_work_budget(presolver, block, affine_row))
+        {
+            ++presolver->stats.affine_psd_budget_skips;
+            presolver->stats.affine_psd_coordinates_skipped +=
+                block->dimension;
+            for (coordinate = 0; coordinate < block->dimension;
+                 ++coordinate)
+            {
+                coordinate_lower[affine_row + coordinate] = -INFINITY;
+                coordinate_upper[affine_row + coordinate] = INFINITY;
+            }
+            affine_row += block->dimension;
+            continue;
+        }
+        for (coordinate = 0; coordinate < block->dimension; ++coordinate)
+        {
+            size_t row = affine_row + coordinate;
+            indices[coordinate] = (int) coordinate;
+            if (coordinate_lower[row] > activity_lower[row])
+            {
+                ++presolver->stats.tightened_affine_cone_envelopes;
+                ++presolver->stats.tightened_cone_envelopes;
+            }
+            if (coordinate_upper[row] < activity_upper[row])
+            {
+                ++presolver->stats.tightened_affine_cone_envelopes;
+                ++presolver->stats.tightened_cone_envelopes;
+            }
+        }
+        if (needs_cpu)
+        {
+            PreFOSConeBlock direct = {
+                block->type, block->dimension, block->matrix_order,
+                indices, block->power_alpha};
+            int block_changed = 0;
+            size_t tightened_before =
+                presolver->stats.tightened_cone_envelopes;
+            status = prefos_internal_propagate_cone_block_envelopes(
+                presolver, &direct, coordinate_lower + affine_row,
+                coordinate_upper + affine_row, &block_changed);
+            if (status != PREFOS_STATUS_OK) goto cleanup;
+            presolver->stats.tightened_affine_cone_envelopes +=
+                presolver->stats.tightened_cone_envelopes -
+                tightened_before;
+        }
+        ++presolver->stats.affine_cones_processed;
+        affine_row += block->dimension;
+    }
+    if (affine_row != problem->affine_cone_matrix.rows)
+    {
+        status = PREFOS_STATUS_NUMERICAL_ERROR;
+        goto cleanup;
+    }
+
+    milliseconds = 0.0;
+    cuda_status = prefos_cuda_affine_row_propagation(
+        workspace, presolver->propagation_lower,
+        presolver->propagation_upper, coordinate_lower, coordinate_upper,
+        PRESOLVE_DEFAULT_MAX_INFERRED_BOUND_MAGNITUDE, variable_lower,
+        variable_upper, &milliseconds);
+    presolver->stats.affine_cone_gpu_milliseconds += milliseconds;
+    if (cuda_status != PREFOS_CUDA_PROPAGATION_OK) goto cleanup;
+    for (coordinate = 0; coordinate < problem->n; ++coordinate)
+    {
+        status = update_variable_envelope(
+            presolver, (int) coordinate, variable_lower[coordinate], 1,
+            changed);
+        if (status != PREFOS_STATUS_OK) goto cleanup;
+        status = update_variable_envelope(
+            presolver, (int) coordinate, variable_upper[coordinate], 0,
+            changed);
+        if (status != PREFOS_STATUS_OK) goto cleanup;
+    }
+    ++presolver->stats.affine_cone_propagation_rounds;
+    ++presolver->stats.affine_cone_gpu_rounds;
+    *used_gpu = 1;
+
+cleanup:
+    free(activity_lower);
+    free(activity_upper);
+    free(coordinate_lower);
+    free(coordinate_upper);
+    free(variable_lower);
+    free(variable_upper);
+    free(flags);
+    free(indices);
+    return status;
+}
+
+PreFOSStatus prefos_internal_propagate_affine_cones(
+    PreFOSPresolver *presolver, int *changed)
+{
+    int used_gpu = 0;
+    PreFOSStatus status =
+        propagate_affine_cones_gpu(presolver, changed, &used_gpu);
+    if (status != PREFOS_STATUS_OK) return status;
+    if (used_gpu) return PREFOS_STATUS_OK;
+    if (presolver->settings.linear_propagation_gpu &&
+        presolver->original.n_affine_cones > 0)
+        ++presolver->stats.affine_cone_gpu_fallbacks;
+    return propagate_affine_cones_cpu(presolver, changed);
 }

@@ -5,6 +5,216 @@
 
 #include "PREFOS_MatrixCompaction.h"
 
+#include "explorers/PREFOS_CudaBackend.h"
+#include "explorers/PREFOS_CudaLinearPropagation.h"
+
+static PreFOSStatus compact_a_without_substitutions_gpu(
+    PreFOSPresolver *presolver, int *used_gpu, int *attempted_gpu)
+{
+    const PreFOSProblemData *source = &presolver->original;
+    PreFOSPresolvedProblem *target = &presolver->reduced;
+    PreFOSCudaWorkspace *workspace;
+    PreFOSCudaPropagationStatus cuda_status;
+    int *row_nnz = NULL, *row_map = NULL;
+    double *shifts = NULL;
+    unsigned char *exact_shift = NULL;
+    size_t row, kept_rows = 0, nnz = 0, removed_empty_rows = 0;
+    double milliseconds = 0.0;
+
+    size_t active_rows = 0;
+    *used_gpu = 0;
+    *attempted_gpu = 0;
+    if (!presolver->settings.structural_reductions_gpu ||
+        source->A.rows == 0 || source->n == 0)
+        return PREFOS_STATUS_OK;
+    for (row = 0; row < source->A.rows; ++row)
+        if (!presolver->remove_rows[row]) ++active_rows;
+    if ((long double) active_rows >
+            0.95L * (long double) source->A.rows &&
+        (long double) target->n > 0.95L * (long double) source->n)
+        return PREFOS_STATUS_OK;
+    *attempted_gpu = 1;
+    workspace = prefos_internal_cuda_workspace_get(presolver, &cuda_status);
+    if (!workspace || cuda_status != PREFOS_CUDA_PROPAGATION_OK)
+        return PREFOS_STATUS_OK;
+
+    row_nnz = (int *) prefos_internal_alloc_array(source->A.rows, sizeof(int));
+    row_map = (int *) prefos_internal_alloc_array(source->A.rows, sizeof(int));
+    shifts =
+        (double *) prefos_internal_alloc_array(source->A.rows, sizeof(double));
+    exact_shift = (unsigned char *) prefos_internal_alloc_array(
+        source->A.rows, sizeof(unsigned char));
+    if (!row_nnz || !row_map || !shifts || !exact_shift)
+    {
+        free(row_nnz);
+        free(row_map);
+        free(shifts);
+        free(exact_shift);
+        return PREFOS_STATUS_OUT_OF_MEMORY;
+    }
+    cuda_status = prefos_cuda_compact_a_analyze(
+        workspace, presolver->remove_rows, presolver->is_fixed,
+        presolver->fixed_values, presolver->original_to_reduced,
+        row_nnz, shifts, exact_shift, &milliseconds);
+    presolver->stats.matrix_compaction_gpu_milliseconds += milliseconds;
+    if (cuda_status != PREFOS_CUDA_PROPAGATION_OK) goto fallback;
+
+    for (row = 0; row < source->A.rows; ++row)
+    {
+        double lower, upper;
+        row_map[row] = -1;
+        if (presolver->remove_rows[row]) continue;
+        if (row_nnz[row] < 0)
+        {
+            cuda_status = PREFOS_CUDA_PROPAGATION_ERROR;
+            goto fallback;
+        }
+        if (exact_shift[row])
+        {
+            int position;
+            shifts[row] = 0.0;
+            for (position = source->A.row_pointers[row];
+                 position < source->A.row_pointers[row + 1]; ++position)
+            {
+                int column = source->A.column_indices[position];
+                if (presolver->is_fixed[column] &&
+                    !prefos_internal_safe_add_product(
+                        &shifts[row], source->A.values[position],
+                        presolver->fixed_values[column]))
+                {
+                    free(row_nnz);
+                    free(row_map);
+                    free(shifts);
+                    free(exact_shift);
+                    return PREFOS_STATUS_NUMERICAL_ERROR;
+                }
+            }
+        }
+        lower = presolver->working_constraint_lower[row] - shifts[row];
+        upper = presolver->working_constraint_upper[row] - shifts[row];
+        if (isnan(lower) || isnan(upper))
+        {
+            free(row_nnz);
+            free(row_map);
+            free(shifts);
+            free(exact_shift);
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        }
+        if (row_nnz[row] == 0 && presolver->settings.remove_empty_rows)
+        {
+            if (lower > presolver->settings.feasibility_tolerance ||
+                upper < -presolver->settings.feasibility_tolerance)
+            {
+                free(row_nnz);
+                free(row_map);
+                free(shifts);
+                free(exact_shift);
+                return PREFOS_STATUS_PRIMAL_INFEASIBLE;
+            }
+            ++removed_empty_rows;
+            continue;
+        }
+        if ((size_t) row_nnz[row] > (size_t) INT_MAX - nnz)
+        {
+            free(row_nnz);
+            free(row_map);
+            free(shifts);
+            free(exact_shift);
+            return PREFOS_STATUS_OUT_OF_MEMORY;
+        }
+        row_map[row] = (int) kept_rows++;
+        nnz += (size_t) row_nnz[row];
+    }
+
+    target->A.rows = kept_rows;
+    target->A.cols = target->n;
+    target->A.nnz = nnz;
+    target->A.row_pointers = (int *) calloc(kept_rows + 1, sizeof(int));
+    target->A.values =
+        (double *) prefos_internal_alloc_array(nnz, sizeof(double));
+    target->A.column_indices =
+        (int *) prefos_internal_alloc_array(nnz, sizeof(int));
+    target->constraint_lower =
+        (double *) prefos_internal_alloc_array(kept_rows, sizeof(double));
+    target->constraint_upper =
+        (double *) prefos_internal_alloc_array(kept_rows, sizeof(double));
+    if (!target->A.row_pointers ||
+        (nnz > 0 && (!target->A.values || !target->A.column_indices)) ||
+        (kept_rows > 0 &&
+         (!target->constraint_lower || !target->constraint_upper)))
+    {
+        free(row_nnz);
+        free(row_map);
+        free(shifts);
+        free(exact_shift);
+        prefos_internal_free_csr(&target->A);
+        free(target->constraint_lower);
+        free(target->constraint_upper);
+        target->constraint_lower = NULL;
+        target->constraint_upper = NULL;
+        return PREFOS_STATUS_OUT_OF_MEMORY;
+    }
+    kept_rows = 0;
+    {
+        int output_write = 0;
+        for (row = 0; row < source->A.rows; ++row)
+        {
+            if (row_map[row] < 0) continue;
+            target->A.row_pointers[kept_rows] = output_write;
+            target->constraint_lower[kept_rows] =
+                presolver->working_constraint_lower[row] - shifts[row];
+            target->constraint_upper[kept_rows] =
+                presolver->working_constraint_upper[row] - shifts[row];
+            output_write += row_nnz[row];
+            ++kept_rows;
+        }
+        target->A.row_pointers[kept_rows] = output_write;
+        if ((size_t) output_write != nnz)
+        {
+            prefos_internal_free_csr(&target->A);
+            free(target->constraint_lower);
+            free(target->constraint_upper);
+            target->constraint_lower = NULL;
+            target->constraint_upper = NULL;
+            cuda_status = PREFOS_CUDA_PROPAGATION_ERROR;
+            goto fallback;
+        }
+    }
+
+    milliseconds = 0.0;
+    cuda_status = prefos_cuda_compact_a_write(
+        workspace, presolver->original_to_reduced, row_map,
+        target->A.row_pointers, kept_rows, nnz, target->A.column_indices,
+        target->A.values, &milliseconds);
+    presolver->stats.matrix_compaction_gpu_milliseconds += milliseconds;
+    if (cuda_status != PREFOS_CUDA_PROPAGATION_OK)
+    {
+        prefos_internal_free_csr(&target->A);
+        free(target->constraint_lower);
+        free(target->constraint_upper);
+        target->constraint_lower = NULL;
+        target->constraint_upper = NULL;
+        goto fallback;
+    }
+    memcpy(presolver->original_to_reduced_rows, row_map,
+           source->A.rows * sizeof(int));
+    presolver->stats.removed_empty_rows += removed_empty_rows;
+    ++presolver->stats.matrix_compaction_gpu_passes;
+    *used_gpu = 1;
+    free(row_nnz);
+    free(row_map);
+    free(shifts);
+    free(exact_shift);
+    return PREFOS_STATUS_OK;
+
+fallback:
+    free(row_nnz);
+    free(row_map);
+    free(shifts);
+    free(exact_shift);
+    return PREFOS_STATUS_OK;
+}
+
 static PreFOSStatus compact_a_without_substitutions(PreFOSPresolver *presolver)
 {
     const PreFOSProblemData *source = &presolver->original;
@@ -13,6 +223,15 @@ static PreFOSStatus compact_a_without_substitutions(PreFOSPresolver *presolver)
     double *shifts;
     size_t row, kept_rows = 0, nnz = 0;
     int write = 0;
+    int used_gpu = 0;
+    int attempted_gpu = 0;
+    PreFOSStatus gpu_status =
+        compact_a_without_substitutions_gpu(presolver, &used_gpu,
+                                            &attempted_gpu);
+    if (gpu_status != PREFOS_STATUS_OK) return gpu_status;
+    if (used_gpu) return PREFOS_STATUS_OK;
+    if (attempted_gpu)
+        ++presolver->stats.matrix_compaction_gpu_fallbacks;
 
     keep_row = (unsigned char *) calloc(source->A.rows, sizeof(unsigned char));
     shifts = (double *) calloc(source->A.rows, sizeof(double));
