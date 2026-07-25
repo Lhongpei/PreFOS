@@ -275,6 +275,10 @@ prefos_internal_reduce_parallel_column_groups(
                 presolver, source, target, ratio, source_lower, source_upper,
                 target_lower, target_upper);
             if (status != PREFOS_STATUS_OK) goto cleanup;
+            prefos_internal_linear_cache_mark_bound_dirty(
+                presolver, target);
+            prefos_internal_linear_cache_mark_bound_dirty(
+                presolver, source);
             presolver->working_box_lower[target_box] = new_lower;
             presolver->working_box_upper[target_box] = new_upper;
             presolver->propagation_lower[target] = new_lower;

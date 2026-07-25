@@ -122,6 +122,8 @@ static PreFOSStatus update_variable_envelope(PreFOSPresolver *presolver, int col
     if (!prefos_internal_is_significant_improvement(presolver, current, candidate,
                                                  is_lower))
         return PREFOS_STATUS_OK;
+    prefos_internal_linear_cache_mark_bound_dirty(
+        presolver, column);
     if (is_lower)
     {
         if (candidate > opposite) candidate = opposite;

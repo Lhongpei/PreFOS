@@ -596,6 +596,81 @@ static int test_event_driven_linear_propagation(void)
     return 0;
 }
 
+static int test_persistent_linear_propagation_cache(void)
+{
+    double A_values[] = {1.0, -1.0};
+    int A_columns[] = {0, 1};
+    int A_rows[] = {0, 2};
+    double constraint_lower[] = {-INFINITY};
+    double constraint_upper[] = {0.0};
+    int Q_rows[] = {0, 0, 0};
+    int R_rows[] = {0};
+    double c[] = {0.0, 0.0};
+    int box_indices[] = {0, 1};
+    double box_lower[] = {-1.0, -1.0};
+    double box_upper[] = {1.0, 1.0};
+    double G_values[] = {1.0};
+    int G_columns[] = {0};
+    int G_rows[] = {0, 1};
+    double h[] = {0.0};
+    PreFOSAffineConeBlock affine_cone = {
+        PREFOS_CONE_NONNEGATIVE, 1, 0, 0.0};
+    PreFOSProblemData problem;
+    PreFOSSettings settings = prefos_strict_settings();
+    PreFOSPresolver *presolver = NULL;
+    const PreFOSPresolvedProblem *reduced;
+    const PreFOSStats *stats;
+    size_t box;
+    int found_y = 0;
+
+    memset(&problem, 0, sizeof(problem));
+    problem.n = 2;
+    problem.A = (PreFOSCsrMatrix){1, 2, 2, A_values, A_columns, A_rows};
+    problem.constraint_lower = constraint_lower;
+    problem.constraint_upper = constraint_upper;
+    problem.Q = (PreFOSCsrMatrix){2, 2, 0, NULL, NULL, Q_rows};
+    problem.q_storage = PREFOS_Q_UPPER_TRIANGULAR;
+    problem.R = (PreFOSCsrMatrix){0, 2, 0, NULL, NULL, R_rows};
+    problem.c = c;
+    problem.n_box = 2;
+    problem.box_indices = box_indices;
+    problem.box_lower = box_lower;
+    problem.box_upper = box_upper;
+    problem.affine_cone_matrix =
+        (PreFOSCsrMatrix){1, 2, 1, G_values, G_columns, G_rows};
+    problem.affine_cone_offset = h;
+    problem.n_affine_cones = 1;
+    problem.affine_cones = &affine_cone;
+
+    settings.free_column_substitution = 0;
+    settings.singleton_column_reduction = 0;
+    settings.bounded_doubleton_substitution = 0;
+    settings.parallel_column_reduction = 0;
+    settings.dual_fixing = 0;
+    settings.remove_redundant_rows = 0;
+
+    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+          PREFOS_STATUS_OK);
+    CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_REDUCED);
+    reduced = prefos_get_reduced_problem(presolver);
+    stats = prefos_get_stats(presolver);
+    CHECK(reduced != NULL && stats != NULL);
+    for (box = 0; box < reduced->n_box; ++box)
+    {
+        if (reduced->box_indices[box] != 1) continue;
+        CHECK(close_to(reduced->box_lower[box], 0.0));
+        found_y = 1;
+    }
+    CHECK(found_y);
+    CHECK(stats->medium_fixed_point_rounds >= 2);
+    CHECK(stats->linear_cache_builds == 1);
+    CHECK(stats->linear_cache_reuses >= 1);
+    CHECK(stats->linear_cache_bound_changes >= 1);
+    CHECK(stats->linear_cache_rows_scheduled >= 1);
+    prefos_free_presolver(presolver);
+    return 0;
+}
+
 static int test_huge_implied_bound_is_skipped(void)
 {
     double A_values[] = {1e-8, 1.0};
@@ -4896,6 +4971,7 @@ int main(void)
     if (test_objective_overflow_is_reported()) return 1;
     if (test_iterative_linear_propagation_with_soc_envelope()) return 1;
     if (test_event_driven_linear_propagation()) return 1;
+    if (test_persistent_linear_propagation_cache()) return 1;
     if (test_huge_implied_bound_is_skipped()) return 1;
     if (test_linear_propagation_detects_infeasibility()) return 1;
     if (test_propagated_bound_policy()) return 1;

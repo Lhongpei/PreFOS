@@ -70,6 +70,7 @@ set(PREFOS_SOURCES
   src/prefos/explorers/PREFOS_ColumnWorkspace.c
   src/prefos/explorers/PREFOS_FreeColumnSubstitution.c
   src/prefos/explorers/PREFOS_LinearPropagation.c
+  src/prefos/explorers/PREFOS_LinearPropagationCache.c
   src/prefos/explorers/PREFOS_ParallelColumns.c
   src/prefos/explorers/PREFOS_ParallelRows.c
   src/prefos/explorers/PREFOS_RedundantBounds.c

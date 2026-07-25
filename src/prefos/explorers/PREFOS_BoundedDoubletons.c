@@ -177,6 +177,8 @@ PreFOSStatus prefos_internal_reduce_bounded_doubletons(
         }
         {
             int target_box = presolver->variable_to_box[target_column];
+            prefos_internal_linear_cache_mark_bound_dirty(
+                presolver, target_column);
             presolver->working_box_lower[target_box] = target_lower;
             presolver->working_box_upper[target_box] = target_upper;
             presolver->propagation_lower[target_column] = target_lower;

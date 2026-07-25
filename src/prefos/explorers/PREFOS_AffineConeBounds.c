@@ -134,6 +134,8 @@ static PreFOSStatus materialize_singleton(PreFOSPresolver *presolver, size_t aff
     status = append_certificate(presolver, affine_row, column, generated_column,
                                 coefficient, offset, candidate, is_lower);
     if (status != PREFOS_STATUS_OK) return status;
+    prefos_internal_linear_cache_mark_bound_dirty(
+        presolver, column);
     if (is_lower)
     {
         presolver->working_box_lower[box_position] = candidate;

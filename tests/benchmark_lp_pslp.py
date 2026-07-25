@@ -336,6 +336,14 @@ def run_prefos(library, data, args):
                 ),
                 propagation_budget_stops=int(stats.linear_budget_stops),
                 propagation_stale_stops=int(stats.linear_stale_stops),
+                linear_cache_builds=int(stats.linear_cache_builds),
+                linear_cache_reuses=int(stats.linear_cache_reuses),
+                linear_cache_bound_changes=int(
+                    stats.linear_cache_bound_changes
+                ),
+                linear_cache_rows_scheduled=int(
+                    stats.linear_cache_rows_scheduled
+                ),
                 propagation_milliseconds=float(
                     stats.linear_propagation_milliseconds
                 ),

@@ -198,6 +198,8 @@ static PreFOSStatus reduce_trivial_row(
             ++presolver->stats.tightened_box_bounds;
         if (new_upper != old_upper)
             ++presolver->stats.tightened_box_bounds;
+        prefos_internal_linear_cache_mark_bound_dirty(
+            presolver, live_column);
         presolver->working_box_lower[box_position] = new_lower;
         presolver->working_box_upper[box_position] = new_upper;
         presolver->propagation_lower[live_column] = new_lower;

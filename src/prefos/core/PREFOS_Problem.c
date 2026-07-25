@@ -5,6 +5,7 @@
 
 #include "PREFOS_Internal.h"
 #include "explorers/PREFOS_CudaBackend.h"
+#include "explorers/PREFOS_LinearPropagation.h"
 
 void prefos_internal_free_csr(PreFOSCsrMatrix *matrix)
 {
@@ -877,6 +878,7 @@ PreFOSStatus prefos_create_presolver(const PreFOSProblemData *problem,
 void prefos_free_presolver(PreFOSPresolver *presolver)
 {
     if (!presolver) return;
+    prefos_internal_free_linear_propagation_cache(presolver);
     prefos_internal_cuda_workspace_release(presolver);
     prefos_internal_free_psd_face_reductions(presolver->psd_face_reductions,
                                           presolver->original.n_cones);

@@ -55,6 +55,7 @@ typedef enum
 } PreFOSSubstitutionMode;
 
 typedef struct PreFOSCudaWorkspace PreFOSCudaWorkspace;
+typedef struct PreFOSLinearPropagationCache PreFOSLinearPropagationCache;
 
 struct PreFOSPresolver
 {
@@ -123,6 +124,7 @@ struct PreFOSPresolver
     size_t normalized_nonnegative_variables;
     size_t normalized_nonnegative_cones;
     size_t n_parallel_column_reductions;
+    PreFOSLinearPropagationCache *linear_propagation_cache;
     PreFOSCudaWorkspace *cuda_workspace;
     int has_run;
 };
@@ -152,6 +154,12 @@ PREFOS_INTERNAL int prefos_internal_mark_fixed_column(
     PreFOSPresolver *presolver, int column, double value);
 PREFOS_INTERNAL int prefos_internal_mark_removed_row(
     PreFOSPresolver *presolver, size_t row);
+/* Record the old canonical bounds before mutating propagation_lower/upper. */
+PREFOS_INTERNAL void prefos_internal_linear_cache_mark_bound_dirty(
+    PreFOSPresolver *presolver, int column);
+/* activity_changed is nonzero when the active terms of the row changed. */
+PREFOS_INTERNAL void prefos_internal_linear_cache_mark_row_dirty(
+    PreFOSPresolver *presolver, size_t row, int activity_changed);
 PREFOS_INTERNAL PreFOSStatus prefos_internal_copy_vector(const void *source, size_t count,
                                                 size_t element_size, void **target);
 PREFOS_INTERNAL void prefos_internal_free_reduced_problem(PreFOSPresolvedProblem *problem);

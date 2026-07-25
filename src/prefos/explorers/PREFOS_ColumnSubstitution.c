@@ -182,6 +182,8 @@ PreFOSStatus prefos_internal_append_column_substitution(
         int *excluded =
             &presolver->residual_source_column[source_row];
         *excluded = *excluded == -1 ? column : -2;
+        prefos_internal_linear_cache_mark_row_dirty(
+            presolver, (size_t) source_row, 1);
         ++presolver->n_residual_row_substitutions;
         ++presolver->stats.residual_row_substitutions;
     }

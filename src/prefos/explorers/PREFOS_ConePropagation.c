@@ -31,6 +31,8 @@ static PreFOSStatus update_cone_envelope_lower(PreFOSPresolver *presolver, int c
     if (!prefos_internal_is_significant_improvement(presolver, current, candidate, 1))
         return PREFOS_STATUS_OK;
     if (candidate > upper) candidate = upper;
+    prefos_internal_linear_cache_mark_bound_dirty(
+        presolver, column);
     presolver->propagation_lower[column] = candidate;
     ++presolver->stats.tightened_cone_envelopes;
     *changed = 1;
@@ -52,6 +54,8 @@ static PreFOSStatus update_cone_envelope_upper(PreFOSPresolver *presolver, int c
     if (!prefos_internal_is_significant_improvement(presolver, current, candidate, 0))
         return PREFOS_STATUS_OK;
     if (candidate < lower) candidate = lower;
+    prefos_internal_linear_cache_mark_bound_dirty(
+        presolver, column);
     presolver->propagation_upper[column] = candidate;
     ++presolver->stats.tightened_cone_envelopes;
     *changed = 1;

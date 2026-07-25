@@ -434,6 +434,10 @@ extern "C"
         size_t fast_fixed_point_rounds;
         size_t medium_fixed_point_rounds;
         size_t residual_row_substitutions;
+        size_t linear_cache_builds;
+        size_t linear_cache_reuses;
+        size_t linear_cache_bound_changes;
+        size_t linear_cache_rows_scheduled;
     } PreFOSStats;
 
     typedef struct

@@ -257,6 +257,10 @@ class PreFOSStats(ct.Structure):
         ("fast_fixed_point_rounds", ct.c_size_t),
         ("medium_fixed_point_rounds", ct.c_size_t),
         ("residual_row_substitutions", ct.c_size_t),
+        ("linear_cache_builds", ct.c_size_t),
+        ("linear_cache_reuses", ct.c_size_t),
+        ("linear_cache_bound_changes", ct.c_size_t),
+        ("linear_cache_rows_scheduled", ct.c_size_t),
     ]
 
 

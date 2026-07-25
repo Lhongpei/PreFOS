@@ -19,6 +19,8 @@ PREFOS_INTERNAL PreFOSStatus
 prefos_internal_propagate_linear_bounds(
     PreFOSPresolver *presolver,
     const PreFOSColumnWorkspace *column_workspace);
+PREFOS_INTERNAL void prefos_internal_free_linear_propagation_cache(
+    PreFOSPresolver *presolver);
 PREFOS_INTERNAL PreFOSStatus
 prefos_internal_remove_redundant_rows_by_activity(
     PreFOSPresolver *presolver,

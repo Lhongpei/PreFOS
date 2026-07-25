@@ -444,6 +444,8 @@ int prefos_internal_mark_fixed_column(PreFOSPresolver *presolver, int column,
             presolver->fixed_column_log[presolver->n_fixed_columns++] =
                 column;
     }
+    prefos_internal_linear_cache_mark_bound_dirty(
+        presolver, column);
     presolver->is_fixed[column] = 1;
     presolver->fixed_values[column] = value;
     presolver->propagation_lower[column] = value;

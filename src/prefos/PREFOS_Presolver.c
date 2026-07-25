@@ -871,6 +871,7 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
 
     if (!presolver) return PREFOS_STATUS_INVALID_ARGUMENT;
     memset(&shared_column_workspace, 0, sizeof(shared_column_workspace));
+    prefos_internal_free_linear_propagation_cache(presolver);
     prefos_internal_cuda_workspace_release(presolver);
     prefos_internal_free_reduced_problem(&presolver->reduced);
     free(presolver->original_to_reduced);
@@ -1134,6 +1135,7 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
             prefos_internal_timer_elapsed_milliseconds(
                 &phase_start, &phase_stop);
     }
+    prefos_internal_free_linear_propagation_cache(presolver);
     {
         PreFOSFastTriggerSignature before_parallel_columns =
             capture_fast_trigger_signature(presolver);
@@ -1284,6 +1286,7 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     return PREFOS_STATUS_OK;
 
 failure:
+    prefos_internal_free_linear_propagation_cache(presolver);
     if (shared_column_workspace_valid)
         prefos_internal_free_column_workspace(
             &shared_column_workspace);

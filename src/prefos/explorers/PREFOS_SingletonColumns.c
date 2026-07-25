@@ -371,6 +371,8 @@ PreFOSStatus prefos_internal_reduce_singleton_columns(
                 else
                     continue;
                 workspace->dirty_row[row] = 1;
+                prefos_internal_linear_cache_mark_row_dirty(
+                    presolver, (size_t) row, 0);
                 ++presolver->stats.tightened_singleton_rows;
                 continue;
             }
