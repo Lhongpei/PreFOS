@@ -415,10 +415,10 @@ static int test_singleton_implied_free_avoids_large_bound_cancellation(void)
     int box_indices[] = {0, 1, 2, 3};
     double box_lower[] = {0.0, 0.0, 0.0, 0.0};
     double box_upper[] = {1e20, 1640.0, 1640.0, 1640.0};
+    double large_bounds[] = {1e20, 1e30};
     PreFOSProblemData problem;
     PreFOSSettings settings = prefos_strict_settings();
-    PreFOSPresolver *presolver = NULL;
-    const PreFOSPresolvedProblem *reduced;
+    size_t case_index;
 
     settings.linear_propagation = 0;
     settings.remove_redundant_rows = 0;
@@ -427,20 +427,28 @@ static int test_singleton_implied_free_avoids_large_bound_cancellation(void)
     settings.bounded_doubleton_substitution = 0;
     settings.parallel_column_reduction = 0;
     settings.dual_fixing = 0;
-    init_linear_problem(
-        &problem, 4, 4, 8, A_values, A_columns, A_rows,
-        row_lower, row_upper, Q_rows, R_rows, c, box_indices,
-        box_lower, box_upper);
+    for (case_index = 0;
+         case_index < sizeof(large_bounds) / sizeof(large_bounds[0]);
+         ++case_index)
+    {
+        PreFOSPresolver *presolver = NULL;
+        const PreFOSPresolvedProblem *reduced;
+        box_upper[0] = large_bounds[case_index];
+        init_linear_problem(
+            &problem, 4, 4, 8, A_values, A_columns, A_rows,
+            row_lower, row_upper, Q_rows, R_rows, c, box_indices,
+            box_lower, box_upper);
 
-    CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
-          PREFOS_STATUS_OK);
-    CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_OK);
-    reduced = prefos_get_reduced_problem(presolver);
-    CHECK(reduced != NULL);
-    CHECK(reduced->n == 4 && reduced->A.rows == 4 &&
-          reduced->A.nnz == 8);
-    CHECK(prefos_get_stats(presolver)->removed_singleton_columns == 0);
-    prefos_free_presolver(presolver);
+        CHECK(prefos_create_presolver(&problem, &settings, &presolver) ==
+              PREFOS_STATUS_OK);
+        CHECK(prefos_run_presolve(presolver) == PREFOS_STATUS_OK);
+        reduced = prefos_get_reduced_problem(presolver);
+        CHECK(reduced != NULL);
+        CHECK(reduced->n == 4 && reduced->A.rows == 4 &&
+              reduced->A.nnz == 8);
+        CHECK(prefos_get_stats(presolver)->removed_singleton_columns == 0);
+        prefos_free_presolver(presolver);
+    }
     return 0;
 }
 

@@ -8,6 +8,7 @@
 #include "PREFOS_CudaLinearPropagation.h"
 #include "core/PREFOS_Timer.h"
 
+#include <float.h>
 #include <stdio.h>
 
 #define PREFOS_MAX_SINGLETON_RESIDUAL_WAVES 16
@@ -413,9 +414,95 @@ static PreFOSStatus remove_cached_singleton_term(
     return PREFOS_STATUS_OK;
 }
 
-static void exclude_singleton_from_activity(
+static int singleton_subtraction_needs_recompute(
+    long double total, long double term, long double residual)
+{
+    long double scale = fmaxl(fabsl(total), fabsl(term));
+    return fabsl(residual) <=
+           64.0L * (long double) DBL_EPSILON * fmaxl(1.0L, scale);
+}
+
+static int add_compensated_term(
+    long double term, long double *sum, long double *correction)
+{
+    long double updated = *sum + term;
+    if (!isfinite(term) || !isfinite(updated)) return 0;
+    if (fabsl(*sum) >= fabsl(term))
+        *correction += (*sum - updated) + term;
+    else
+        *correction += (term - updated) + *sum;
+    *sum = updated;
+    return isfinite(*correction);
+}
+
+static PreFOSStatus recompute_singleton_rest_activity(
+    const PreFOSPresolver *presolver, int row, int excluded_column,
+    long double *rest_min, long double *rest_max,
+    int *finite_rest_min, int *finite_rest_max)
+{
+    const PreFOSCsrMatrix *matrix = &presolver->original.A;
+    long double minimum_sum = 0.0L, maximum_sum = 0.0L;
+    long double minimum_correction = 0.0L, maximum_correction = 0.0L;
+    int position;
+
+    *finite_rest_min = 1;
+    *finite_rest_max = 1;
+    for (position = matrix->row_pointers[row];
+         position < matrix->row_pointers[row + 1]; ++position)
+    {
+        int column = matrix->column_indices[position];
+        double coefficient = matrix->values[position];
+        double minimum_bound, maximum_bound;
+        if (coefficient == 0.0 || column == excluded_column ||
+            presolver->is_fixed[column] ||
+            presolver->is_parallel_removed[column])
+            continue;
+        if (presolver->is_substituted[column])
+        {
+            if (!prefos_internal_term_is_active_in_row(
+                    presolver, (size_t) row, column))
+                continue;
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        }
+        minimum_bound =
+            coefficient > 0.0
+                ? presolver->propagation_lower[column]
+                : presolver->propagation_upper[column];
+        maximum_bound =
+            coefficient > 0.0
+                ? presolver->propagation_upper[column]
+                : presolver->propagation_lower[column];
+        if (isfinite(minimum_bound))
+        {
+            if (!add_compensated_term(
+                    (long double) coefficient *
+                        (long double) minimum_bound,
+                    &minimum_sum, &minimum_correction))
+                return PREFOS_STATUS_NUMERICAL_ERROR;
+        }
+        else
+            *finite_rest_min = 0;
+        if (isfinite(maximum_bound))
+        {
+            if (!add_compensated_term(
+                    (long double) coefficient *
+                        (long double) maximum_bound,
+                    &maximum_sum, &maximum_correction))
+                return PREFOS_STATUS_NUMERICAL_ERROR;
+        }
+        else
+            *finite_rest_max = 0;
+    }
+    *rest_min = minimum_sum + minimum_correction;
+    *rest_max = maximum_sum + maximum_correction;
+    return isfinite(*rest_min) && isfinite(*rest_max)
+               ? PREFOS_STATUS_OK
+               : PREFOS_STATUS_NUMERICAL_ERROR;
+}
+
+static PreFOSStatus exclude_singleton_from_activity(
     const PreFOSPresolver *presolver,
-    const PreFOSSingletonRowActivity *activity, int column,
+    const PreFOSSingletonRowActivity *activity, int row, int column,
     double pivot, long double *rest_min, long double *rest_max,
     int *finite_rest_min, int *finite_rest_max)
 {
@@ -425,24 +512,40 @@ static void exclude_singleton_from_activity(
     double maximum_bound =
         pivot > 0.0 ? presolver->propagation_upper[column]
                     : presolver->propagation_lower[column];
+    int recompute = 0;
     *rest_min = activity->finite_min;
     *rest_max = activity->finite_max;
     if (isfinite(minimum_bound))
     {
-        *finite_rest_min = activity->n_infinite_min == 0;
-        *rest_min -=
+        long double term =
             (long double) pivot * (long double) minimum_bound;
+        *finite_rest_min = activity->n_infinite_min == 0;
+        *rest_min -= term;
+        recompute |=
+            *finite_rest_min &&
+            singleton_subtraction_needs_recompute(
+                activity->finite_min, term, *rest_min);
     }
     else
         *finite_rest_min = activity->n_infinite_min == 1;
     if (isfinite(maximum_bound))
     {
-        *finite_rest_max = activity->n_infinite_max == 0;
-        *rest_max -=
+        long double term =
             (long double) pivot * (long double) maximum_bound;
+        *finite_rest_max = activity->n_infinite_max == 0;
+        *rest_max -= term;
+        recompute |=
+            *finite_rest_max &&
+            singleton_subtraction_needs_recompute(
+                activity->finite_max, term, *rest_max);
     }
     else
         *finite_rest_max = activity->n_infinite_max == 1;
+    if (recompute)
+        return recompute_singleton_rest_activity(
+            presolver, row, column, rest_min, rest_max,
+            finite_rest_min, finite_rest_max);
+    return PREFOS_STATUS_OK;
 }
 
 static PreFOSStatus analyze_singleton_candidate(
@@ -750,9 +853,10 @@ process_candidates:
             target_count = row_activity->n_active_terms - 1;
         if (trace_timing)
             prefos_internal_timer_now(&operation_start);
-        exclude_singleton_from_activity(
-            presolver, row_activity, (int) column, pivot,
+        status = exclude_singleton_from_activity(
+            presolver, row_activity, row, (int) column, pivot,
             &rest_min, &rest_max, &finite_rest_min, &finite_rest_max);
+        if (status != PREFOS_STATUS_OK) goto cleanup;
         if (trace_timing)
         {
             prefos_internal_timer_now(&operation_stop);
