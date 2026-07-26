@@ -155,7 +155,12 @@ prefos_internal_cuda_workspace_get(PreFOSPresolver *presolver,
                 problem->affine_cone_offset, problem->n_affine_cones,
                 affine_cone_types, affine_cone_starts,
                 affine_cone_matrix_orders, affine_cone_power_alphas);
-        (void) affine_status;
+        if (affine_status != PREFOS_CUDA_PROPAGATION_OK)
+        {
+            prefos_cuda_workspace_free(presolver->cuda_workspace);
+            presolver->cuda_workspace = NULL;
+            result = affine_status;
+        }
     }
 
 cleanup:

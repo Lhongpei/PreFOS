@@ -26,6 +26,7 @@ TEXT_SUFFIXES = {
 }
 TEXT_NAMES = {".clang-format", ".gitignore", "CMakeLists.txt"}
 DERIVED_PREFIXES = ("include/common/", "src/common/")
+PREFOS_ORIGINAL_COMMON_FILES = {"include/common/PreFOSThread.h"}
 
 
 def repository_files():
@@ -67,7 +68,10 @@ def main():
         if "Copyright 2026 Hongpei Li" not in header:
             errors.append(f"missing PreFOS copyright header: {path}")
         path_string = path.as_posix()
-        if path_string.startswith(DERIVED_PREFIXES):
+        if (
+            path_string.startswith(DERIVED_PREFIXES)
+            and path_string not in PREFOS_ORIGINAL_COMMON_FILES
+        ):
             if "Copyright 2025-2026 Daniel Cederberg" not in header:
                 errors.append(f"missing upstream copyright header: {path}")
             if "Modified for PreFOS in 2026." not in header:

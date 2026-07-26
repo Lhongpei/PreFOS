@@ -50,10 +50,13 @@ set(PREFOS_SOURCES
   src/prefos/cones/PREFOS_PowerCone.c
   src/prefos/core/PREFOS_AffineConeCompaction.c
   src/prefos/core/PREFOS_AffineConeFaces.c
+  src/prefos/core/PREFOS_CertificateRecovery.c
+  src/prefos/core/PREFOS_Certificates.c
   src/prefos/core/PREFOS_MatrixCompaction.c
   src/prefos/core/PREFOS_PassManager.c
   src/prefos/core/PREFOS_Postsolve.c
   src/prefos/core/PREFOS_Problem.c
+  src/prefos/core/PREFOS_RayRecovery.c
   src/prefos/core/PREFOS_Timer.c
   src/prefos/core/PREFOS_WorkingMatrix.c
   src/prefos/explorers/PREFOS_AffineConeAggregation.c
@@ -186,6 +189,26 @@ if(PREFOS_BUILD_TESTING)
   endif()
   add_test(NAME prefos_column_reduction_tests COMMAND prefos_column_reduction_tests)
 
+  add_executable(prefos_certificate_tests tests/test_certificates.c)
+  target_link_libraries(prefos_certificate_tests PRIVATE PreFOS::PreFOS)
+  if(NOT MSVC)
+    target_link_libraries(prefos_certificate_tests PRIVATE m)
+  endif()
+  add_test(NAME prefos_certificate_tests COMMAND prefos_certificate_tests)
+
+  if(PREFOS_ENABLE_CUDA)
+    add_executable(prefos_cuda_path_tests tests/test_cuda_paths.c)
+    target_link_libraries(prefos_cuda_path_tests PRIVATE PreFOS::PreFOS)
+    if(NOT MSVC)
+      target_link_libraries(prefos_cuda_path_tests PRIVATE m)
+    endif()
+    add_test(NAME prefos_cuda_path_tests COMMAND prefos_cuda_path_tests)
+    set_tests_properties(prefos_cuda_path_tests PROPERTIES
+      SKIP_RETURN_CODE 77
+      ENVIRONMENT "PREFOS_FORCE_PARALLEL_ROW_RESCAN=1"
+    )
+  endif()
+
   add_executable(prefos_cpp_tests tests/test_prefos_cpp.cpp)
   target_compile_features(prefos_cpp_tests PRIVATE cxx_std_11)
   target_link_libraries(prefos_cpp_tests PRIVATE PreFOS::PreFOS)
@@ -196,6 +219,8 @@ if(PREFOS_BUILD_TESTING)
     target_link_options(prefos_tests PRIVATE --coverage)
     target_compile_options(prefos_column_reduction_tests PRIVATE -O0 -g --coverage)
     target_link_options(prefos_column_reduction_tests PRIVATE --coverage)
+    target_compile_options(prefos_certificate_tests PRIVATE -O0 -g --coverage)
+    target_link_options(prefos_certificate_tests PRIVATE --coverage)
   endif()
 endif()
 

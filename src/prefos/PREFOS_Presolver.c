@@ -2411,8 +2411,16 @@ PreFOSStatus prefos_run_presolve(PreFOSPresolver *presolver)
     if (source->n_box > 0)
     {
         prefos_internal_timer_now(&phase_start);
+#if defined(PREFOS_HAS_CUDA)
+        status = presolver->settings.structural_reductions_gpu
+                     ? prefos_internal_build_column_workspace(
+                           presolver, &shared_column_workspace)
+                     : prefos_internal_build_column_workspace_cpu(
+                           presolver, &shared_column_workspace);
+#else
         status = prefos_internal_build_column_workspace_cpu(
             presolver, &shared_column_workspace);
+#endif
         prefos_internal_timer_now(&phase_stop);
         presolver->stats.structural_reduction_milliseconds +=
             prefos_internal_timer_elapsed_milliseconds(

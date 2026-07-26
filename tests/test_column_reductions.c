@@ -264,10 +264,14 @@ static int test_singleton_column_substitution(void)
     CHECK(close_to(reduced->objective_offset, 0.0));
     CHECK(stats->removed_singleton_columns == 1);
     CHECK(stats->removed_empty_columns == 1);
-    CHECK(stats->column_csc_gpu_builds == 0);
-    CHECK(stats->column_csc_gpu_fallbacks == 0);
-    CHECK(stats->singleton_column_gpu_passes == 0);
-    CHECK(stats->singleton_column_gpu_fallbacks == 0);
+    if (stats->column_csc_gpu_builds > 0)
+    {
+        CHECK(stats->column_csc_gpu_fallbacks == 0);
+        CHECK(stats->singleton_column_gpu_passes > 0);
+        CHECK(stats->singleton_column_gpu_fallbacks == 0);
+    }
+    else
+        CHECK(stats->singleton_column_gpu_passes == 0);
     CHECK(prefos_postsolve_primal(presolver, NULL, original_x) ==
           PREFOS_STATUS_OK);
     CHECK(close_to(original_x[0], 0.0) && close_to(original_x[1], 2.0));
@@ -1560,8 +1564,13 @@ static int test_parallel_column_reductions(void)
         reduced = prefos_get_reduced_problem(presolver);
         CHECK(reduced->n == 2 && reduced->A.nnz == 4);
         CHECK(prefos_get_stats(presolver)->merged_parallel_columns == 2);
-        CHECK(prefos_get_stats(presolver)->parallel_column_gpu_passes == 0);
-        CHECK(prefos_get_stats(presolver)->parallel_column_gpu_fallbacks == 0);
+        if (prefos_get_stats(presolver)->column_csc_gpu_builds > 0)
+        {
+            CHECK(prefos_get_stats(presolver)->parallel_column_gpu_passes > 0);
+            CHECK(prefos_get_stats(presolver)->parallel_column_gpu_fallbacks == 0);
+        }
+        else
+            CHECK(prefos_get_stats(presolver)->parallel_column_gpu_passes == 0);
         CHECK(close_to(reduced->box_lower[0], -3.0));
         CHECK(close_to(reduced->box_upper[0], 3.0));
         CHECK(prefos_postsolve_primal(presolver, reduced_x, original_x) ==

@@ -492,6 +492,40 @@ extern "C"
         int passed;
     } PreFOSPostsolveKKTVerification;
 
+    typedef struct
+    {
+        double stationarity_violation;
+        double row_dual_violation;
+        double domain_dual_violation;
+        double certificate_value;
+        int passed;
+    } PreFOSInfeasibilityCertificateResiduals;
+
+    typedef struct
+    {
+        PreFOSInfeasibilityCertificateResiduals reduced;
+        PreFOSInfeasibilityCertificateResiduals original;
+        double certificate_value_absolute_error;
+        int passed;
+    } PreFOSPostsolveInfeasibilityCertificateVerification;
+
+    typedef struct
+    {
+        double row_recession_violation;
+        double domain_recession_violation;
+        double quadratic_null_violation;
+        double objective_direction;
+        int passed;
+    } PreFOSUnboundedRayResiduals;
+
+    typedef struct
+    {
+        PreFOSUnboundedRayResiduals reduced;
+        PreFOSUnboundedRayResiduals original;
+        double objective_direction_absolute_error;
+        int passed;
+    } PreFOSPostsolveUnboundedRayVerification;
+
     typedef enum
     {
         PREFOS_FACE_RSOC_U_ZERO = 0,
@@ -640,6 +674,39 @@ extern "C"
         double *original_y, double *original_z, double *original_affine_z);
 
     /*
+     * Recover a primal-infeasibility certificate supplied by the reduced
+     * solver. The certificate convention is
+     * A^T*y + z + G^T*affine_z = 0, with y and z in the polar normals of the
+     * ranged rows and variable domain, -affine_z in the affine dual cones,
+     * and a strictly negative total support value.
+     */
+    PREFOS_API PreFOSStatus prefos_postsolve_infeasibility_certificate(
+        const PreFOSPresolver *presolver, const double *reduced_y,
+        const double *reduced_z, const double *reduced_affine_z,
+        double tolerance, double *original_y, double *original_z,
+        double *original_affine_z);
+
+    /*
+     * Extended certificate recovery accepts normals to an exposed reduced
+     * cone face and must be paired with the extended certificate verifier.
+     */
+    PREFOS_API PreFOSStatus
+    prefos_postsolve_extended_infeasibility_certificate(
+        const PreFOSPresolver *presolver, const double *reduced_y,
+        const double *reduced_z, const double *reduced_affine_z,
+        double tolerance, double *original_y, double *original_z,
+        double *original_affine_z);
+
+    /*
+     * Recover a primal recession direction supplied by a reduced solver.
+     * For a convex QP certificate, H*d = 0 and c^T*d < 0, where
+     * H = Q + R^T*D*R.
+     */
+    PREFOS_API PreFOSStatus prefos_postsolve_unbounded_ray(
+        const PreFOSPresolver *presolver, const double *reduced_ray,
+        double tolerance, double *original_ray);
+
+    /*
      * Audit a reduced primal point after postsolve. This checks objective
      * identity and primal feasibility in both the reduced and original model.
      * It is intended as a debug/correctness gate, not a solver-side hot path.
@@ -669,6 +736,23 @@ extern "C"
         const double *reduced_y, const double *reduced_z,
         const double *reduced_affine_z, double tolerance,
         PreFOSPostsolveKKTVerification *verification);
+
+    PREFOS_API PreFOSStatus prefos_verify_postsolve_infeasibility_certificate(
+        const PreFOSPresolver *presolver, const double *reduced_y,
+        const double *reduced_z, const double *reduced_affine_z,
+        double tolerance,
+        PreFOSPostsolveInfeasibilityCertificateVerification *verification);
+
+    PREFOS_API PreFOSStatus
+    prefos_verify_postsolve_extended_infeasibility_certificate(
+        const PreFOSPresolver *presolver, const double *reduced_y,
+        const double *reduced_z, const double *reduced_affine_z,
+        double tolerance,
+        PreFOSPostsolveInfeasibilityCertificateVerification *verification);
+
+    PREFOS_API PreFOSStatus prefos_verify_postsolve_unbounded_ray(
+        const PreFOSPresolver *presolver, const double *reduced_ray,
+        double tolerance, PreFOSPostsolveUnboundedRayVerification *verification);
 
     PREFOS_API const char *prefos_status_string(PreFOSStatus status);
 

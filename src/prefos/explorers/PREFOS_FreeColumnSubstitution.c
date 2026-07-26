@@ -156,10 +156,58 @@ static int column_has_free_input_domain(
            presolver->original.box_upper[box_position] == INFINITY;
 }
 
+static int working_bound_can_be_dropped(
+    const PreFOSPresolver *presolver, int column, int box_position,
+    int source_row, int is_lower)
+{
+    const PresolveTransformationLog *log = &presolver->transformations;
+    const size_t *latest =
+        is_lower ? presolver->latest_lower_bound_change
+                 : presolver->latest_upper_bound_change;
+    double bound =
+        is_lower ? presolver->working_box_lower[box_position]
+                 : presolver->working_box_upper[box_position];
+    size_t record_index;
+    const PresolveBoundChangeRecord *record;
+
+    /*
+     * A bound certified by a live row remains implied after substitution.
+     * A bound whose source row was already removed is the surviving form of
+     * that row and must not disappear with the column.
+     */
+    if (!isfinite(bound)) return 1;
+    if (source_row < 0 || !latest) return 0;
+    record_index = latest[column];
+    if (record_index == SIZE_MAX || record_index >= log->n_bound_changes)
+        return 0;
+    record = &log->bound_changes[record_index];
+    if (record->column != column ||
+        (int) record->is_lower != !!is_lower ||
+        record->implied_bound != bound ||
+        record->row < 0 ||
+        (size_t) record->row >= presolver->original.A.rows)
+        return 0;
+    return record->row == source_row ||
+           !presolver->remove_rows[record->row];
+}
+
+static int column_has_droppable_working_domain(
+    const PreFOSPresolver *presolver, int column, int box_position,
+    int source_row)
+{
+    return column_has_free_input_domain(presolver, box_position) &&
+           (source_row < 0 ||
+            (working_bound_can_be_dropped(
+                 presolver, column, box_position, source_row, 1) &&
+             working_bound_can_be_dropped(
+                 presolver, column, box_position, source_row, 0)));
+}
+
 static int column_can_be_eliminated(const PreFOSPresolver *presolver, int column,
                                     const unsigned char *quadratic_column,
                                     const unsigned char *factor_column,
-                                    const unsigned char *protected_target)
+                                    const unsigned char *protected_target,
+                                    int source_row)
 {
     int box_position = presolver->variable_to_box[column];
     return box_position >= 0 && !presolver->is_fixed[column] &&
@@ -167,7 +215,8 @@ static int column_can_be_eliminated(const PreFOSPresolver *presolver, int column
            !presolver->affine_protected_columns[column] &&
            presolver->substitution_incoming_depth[column] <
                PREFOS_MAX_SUBSTITUTION_DEPTH &&
-           column_has_free_input_domain(presolver, box_position) &&
+           column_has_droppable_working_domain(
+               presolver, column, box_position, source_row) &&
            !quadratic_column[column] && !factor_column[column];
 }
 
@@ -336,7 +385,7 @@ static int has_enough_free_aggregation_candidates(
                 break;
             if (column_can_be_eliminated(
                     presolver, column, quadratic_column,
-                    factor_column, protected_target))
+                    factor_column, protected_target, -1))
                 has_candidate = 1;
         }
         if (live >= 2 &&
@@ -414,7 +463,7 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
         {
             if (column_can_be_eliminated(
                     presolver, (int) row, quadratic_column, factor_column,
-                    protected_target))
+                    protected_target, -1))
             {
                 has_candidate = 1;
                 break;
@@ -523,7 +572,7 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
 
                 if (!column_can_be_eliminated(presolver, eliminated,
                                               quadratic_column, factor_column,
-                                              protected_target))
+                                              protected_target, (int) row))
                     continue;
                 active_degree = (size_t) active_degrees[eliminated];
                 if (active_degree == 0 ||

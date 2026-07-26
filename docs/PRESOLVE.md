@@ -440,18 +440,45 @@ as `y = y_upper - y_lower` and `z = z_upper - z_lower` before calling the KKT
 API. Use `prefos_strict_settings()` for exact-equivalence/KKT regression tests;
 the default settings intentionally allow tolerance-based model changes.
 
+For a primal-infeasibility proof returned by a reduced solver,
+`prefos_postsolve_infeasibility_certificate()` replays the same transformation
+log with the homogeneous Farkas convention
+
+```math
+A^\top y + z + G^\top \widehat z = 0.
+```
+
+Here `y` and `z` are support-domain normals for the ranged rows and direct
+variable domains, `-z` lies in each direct cone dual, and
+`-\widehat z` lies in each affine cone dual. The required separating value is
+the row support plus the direct-domain support minus
+`\widehat z^\top h`, and must be strictly negative. If presolve exposes a
+proper cone face, the standard API reports
+`PREFOS_STATUS_DUAL_RECOVERY_UNAVAILABLE`; use
+`prefos_postsolve_extended_infeasibility_certificate()` for face normals.
+The matching verification APIs independently check stationarity, polar
+membership, separation, and value preservation on both models.
+
+`prefos_postsolve_unbounded_ray()` recovers a homogeneous primal recession
+direction. Its verifier checks the recession conditions for ranged rows,
+boxes, direct cones, and affine cones, together with
+`(Q + R^\top D R)d = 0` and `c^\top d < 0`. These certificate APIs recover
+proof objects supplied by a solver for a successfully produced reduced model;
+they do not manufacture a proof object for an early infeasibility or
+unboundedness status detected inside presolve.
+
 The regular C tests include deterministic round-trip and feasible-grid checks,
-plus affine PSD component decomposition, primal equivalence, and full-dual
-`svec` embedding checks.
-Two optional randomized differential harnesses solve both the original and
-reduced problems, then audit primal postsolve, objective identity, and KKT
-postsolve:
+plus affine PSD component decomposition, primal equivalence, full-dual `svec`
+embedding, deterministic Farkas certificates, and unbounded rays.
+Three optional randomized differential harnesses independently solve reduced
+models and audit primal, KKT, certificate, and ray postsolve:
 
 ```code
 cmake --build build --target prefos_tests
 ctest --test-dir build --output-on-failure
 python3 tests/differential_prefos.py --seeds 100
 python3 tests/differential_conic_prefos.py --seeds 100
+python3 tests/differential_certificates.py --seeds 100
 ```
 
 `differential_prefos.py` uses OSQP for box QPs. The Clarabel-based conic harness
@@ -461,6 +488,10 @@ rotated-SOC single-axis faces, and PSD faces with one or two zero diagonals. Its
 strongly convex objectives make the direct and postsolved primal solutions
 independently comparable. Use `--start-seed` to replay or split a failing seed
 range.
+
+`differential_certificates.py` uses HiGHS through SciPy to construct reduced
+Farkas certificates and recession rays independently, then requires the public
+verifiers to accept both the reduced proof and its recovered original form.
 
 The differential scripts require Python packages `numpy` and `scipy`, plus
 `osqp` or `clarabel` for the corresponding harness. The presolver library

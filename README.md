@@ -83,9 +83,10 @@ PreFOS follows an opaque-presolver lifecycle:
 
 1. `prefos_create_presolver()` validates and deep-copies the input model.
 2. `prefos_run_presolve()` executes reductions and exposes the reduced model.
-3. `prefos_postsolve_primal()` or `prefos_postsolve_primal_dual()` maps a reduced
-   solution back to the original model.
-4. Verification APIs independently audit primal equivalence and KKT recovery.
+3. Postsolve APIs map reduced primal-dual solutions, infeasibility
+   certificates, or unbounded rays back to the original model.
+4. Verification APIs independently audit primal equivalence, KKT recovery,
+   Farkas certificates, and recession rays.
 
 ---
 ## Lineage and Citation
@@ -125,8 +126,9 @@ PreFOS provides a lightweight, solver-oriented presolve pipeline:
   reductions, and affine-cone structure analysis.
 - Objective handling preserves sparse `Q + R^T D R` structure through
   elimination and compaction.
-- Ordered transformation records support primal, primal-dual, and extended-dual
-  postsolve together with independent equivalence and KKT verification.
+- Ordered transformation records support primal-dual, Farkas-certificate, and
+  unbounded-ray postsolve, including exposed-face extended certificates and
+  independent reduced/original verification.
 - Linear and cone propagation use hybrid event-driven and bulk CPU engines,
   with an optional shared-workspace CUDA backend for bulk propagation and
   structural candidate detection.
