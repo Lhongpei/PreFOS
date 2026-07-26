@@ -27,6 +27,66 @@ static double choose_interval_value(double lower, double upper)
     return 0.0;
 }
 
+static PreFOSStatus replay_infinite_fixed_column_primal(
+    const PresolveColumnTransformationRecord *record,
+    size_t columns, double *original_x)
+{
+    long double extreme;
+    size_t row;
+
+    if (record->column < 0 ||
+        (size_t) record->column >= columns ||
+        (record->direction != -1 && record->direction != 1) ||
+        (record->n_rows > 0 &&
+         (!record->row_starts || !record->row_sides)) ||
+        (record->length > 0 &&
+         (!record->indices || !record->coefficients)))
+        return PREFOS_STATUS_NUMERICAL_ERROR;
+    extreme = (long double) record->value;
+    if (!isfinite(extreme)) extreme = 0.0L;
+    for (row = 0; row < record->n_rows; ++row)
+    {
+        int start = record->row_starts[row];
+        int end = record->row_starts[row + 1];
+        long double residual =
+            (long double) record->row_sides[row];
+        long double pivot = 0.0L;
+        int position;
+        if (start < 0 || end < start ||
+            (size_t) end > record->length)
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        for (position = start; position < end; ++position)
+        {
+            int column = record->indices[position];
+            double coefficient = record->coefficients[position];
+            if (column < 0 || (size_t) column >= columns ||
+                !isfinite(coefficient))
+                return PREFOS_STATUS_NUMERICAL_ERROR;
+            if (column == record->column)
+                pivot += (long double) coefficient;
+            else
+                residual -=
+                    (long double) coefficient *
+                    (long double) original_x[column];
+        }
+        if (pivot == 0.0L || !isfinite(residual) ||
+            !isfinite(pivot))
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        residual /= pivot;
+        if (!isfinite(residual))
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        if (record->direction > 0)
+            extreme = fmaxl(extreme, residual);
+        else
+            extreme = fminl(extreme, residual);
+    }
+    if (!isfinite(extreme) ||
+        fabsl(extreme) > (long double) DBL_MAX)
+        return PREFOS_STATUS_NUMERICAL_ERROR;
+    original_x[record->column] = (double) extreme;
+    return PREFOS_STATUS_OK;
+}
+
 static PreFOSStatus replay_parallel_column_primal(
     const PresolveColumnTransformationRecord *record, size_t columns,
     double tolerance,
@@ -109,6 +169,14 @@ PreFOSStatus prefos_postsolve_primal(const PreFOSPresolver *presolver,
         if (event->type != PRESOLVE_TRANSFORMATION_COLUMN) continue;
         record =
             &presolver->transformations.column_transformations[event->record_index];
+        if (record->type == PRESOLVE_COLUMN_FIXED_INFINITE)
+        {
+            PreFOSStatus status =
+                replay_infinite_fixed_column_primal(
+                    record, presolver->original.n, original_x);
+            if (status != PREFOS_STATUS_OK) return status;
+            continue;
+        }
         if (record->type == PRESOLVE_COLUMN_FIXED && record->source_row == -1 &&
             record->column_tag < 0)
             continue;
@@ -546,10 +614,41 @@ static PreFOSStatus transfer_bound_dual(const PreFOSPresolver *presolver,
                                      double *z, int *changed)
 {
     const PreFOSCsrMatrix *A = &presolver->original.A;
-    int p, target_position = -1;
+    const int *indices;
+    const double *coefficients;
+    size_t length, position;
+    int target_found = 0;
     double multiplier = z[record->column];
     double coefficient, delta, multiplier_tolerance = tolerance;
     int box_position = presolver->variable_to_box[record->column];
+
+    if (record->row < 0 || (size_t) record->row >= A->rows)
+        return PREFOS_STATUS_NUMERICAL_ERROR;
+    if (record->has_source_row_record)
+    {
+        const PresolveRowTransformationRecord *source;
+        if (record->source_row_record_index >=
+            presolver->transformations.n_row_transformations)
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        source = &presolver->transformations.row_transformations[
+            record->source_row_record_index];
+        if (source->type != PRESOLVE_ROW_BOUND_CHANGE_SOURCE ||
+            source->row != record->row ||
+            (source->length > 0 &&
+             (!source->indices || !source->coefficients)))
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        indices = source->indices;
+        coefficients = source->coefficients;
+        length = source->length;
+    }
+    else
+    {
+        int begin = A->row_pointers[record->row];
+        int end = A->row_pointers[record->row + 1];
+        indices = A->column_indices + begin;
+        coefficients = A->values + begin;
+        length = (size_t) (end - begin);
+    }
 
     if (box_position >= 0)
     {
@@ -578,27 +677,28 @@ static PreFOSStatus transfer_bound_dual(const PreFOSPresolver *presolver,
         (!record->is_lower && multiplier <= multiplier_tolerance))
         return PREFOS_STATUS_OK;
 
-    for (p = A->row_pointers[record->row]; p < A->row_pointers[record->row + 1]; ++p)
+    coefficient = 0.0;
+    for (position = 0; position < length; ++position)
     {
-        if (A->column_indices[p] == record->column)
+        if (indices[position] == record->column)
         {
-            target_position = p;
+            coefficient = coefficients[position];
+            target_found = 1;
             break;
         }
     }
-    if (target_position < 0) return PREFOS_STATUS_NUMERICAL_ERROR;
-    coefficient = A->values[target_position];
-    if (coefficient == 0.0 ||
+    if (!target_found || coefficient == 0.0 ||
         !prefos_internal_safe_product(1.0 / coefficient, multiplier, &delta))
         return PREFOS_STATUS_NUMERICAL_ERROR;
 
     if (!prefos_internal_safe_add_product(&y[record->row], 1.0, delta))
         return PREFOS_STATUS_NUMERICAL_ERROR;
-    for (p = A->row_pointers[record->row]; p < A->row_pointers[record->row + 1]; ++p)
+    for (position = 0; position < length; ++position)
     {
-        int column = A->column_indices[p];
+        int column = indices[position];
         if (column == record->column) continue;
-        if (!prefos_internal_safe_add_product(&z[column], -A->values[p], delta))
+        if (!prefos_internal_safe_add_product(
+                &z[column], -coefficients[position], delta))
             return PREFOS_STATUS_NUMERICAL_ERROR;
     }
     z[record->column] = 0.0;
@@ -982,6 +1082,14 @@ replay_column_transformation(const PreFOSPresolver *presolver,
     double source_coefficient = 0.0;
     PreFOSStatus status;
 
+    if (record->type == PRESOLVE_COLUMN_FIXED_INFINITE)
+    {
+        if (record->column < 0 ||
+            (size_t) record->column >= presolver->original.n)
+            return PREFOS_STATUS_NUMERICAL_ERROR;
+        original_z[record->column] = 0.0;
+        return PREFOS_STATUS_OK;
+    }
     if (record->type == PRESOLVE_COLUMNS_PARALLEL)
     {
         if (record->column < 0 || record->secondary_column < 0 ||

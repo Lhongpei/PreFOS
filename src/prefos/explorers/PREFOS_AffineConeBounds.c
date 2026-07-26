@@ -136,14 +136,19 @@ static PreFOSStatus materialize_singleton(PreFOSPresolver *presolver, size_t aff
     if (status != PREFOS_STATUS_OK) return status;
     prefos_internal_linear_cache_mark_bound_dirty(
         presolver, column);
+    prefos_internal_mark_fixed_box_dirty(presolver, column);
     if (is_lower)
     {
+        prefos_internal_clear_box_bound_provenance(
+            presolver, column, 1);
         presolver->working_box_lower[box_position] = candidate;
         if (candidate > presolver->propagation_lower[column])
             presolver->propagation_lower[column] = candidate;
     }
     else
     {
+        prefos_internal_clear_box_bound_provenance(
+            presolver, column, 0);
         presolver->working_box_upper[box_position] = candidate;
         if (candidate < presolver->propagation_upper[column])
             presolver->propagation_upper[column] = candidate;

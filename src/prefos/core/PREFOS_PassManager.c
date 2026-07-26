@@ -10,6 +10,8 @@
 #include "explorers/PREFOS_ColumnReductions.h"
 #include "explorers/PREFOS_TrivialReductions.h"
 
+#include <stdio.h>
+
 #define PREFOS_MAX_FAST_FIXED_POINT_ROUNDS 16
 
 typedef struct
@@ -49,11 +51,8 @@ static int progress_changed(PreFOSFastProgress before,
 
 static PreFOSStatus collect_newly_fixed_rows(
     const PreFOSPresolver *presolver,
-    const PreFOSColumnWorkspace *workspace,
-    size_t *fixed_cursor, unsigned char *row_queued,
-    int *candidate_rows, size_t *candidate_count)
+    PreFOSColumnWorkspace *workspace, size_t *fixed_cursor)
 {
-    *candidate_count = 0;
     while (*fixed_cursor < presolver->n_fixed_columns)
     {
         int column = presolver->fixed_column_log[(*fixed_cursor)++];
@@ -62,12 +61,14 @@ static PreFOSStatus collect_newly_fixed_rows(
              position < workspace->ends[column]; ++position)
         {
             int row = workspace->rows[position];
-            if (presolver->remove_rows[row] || row_queued[row])
+            if (presolver->remove_rows[row])
                 continue;
-            if (*candidate_count >= presolver->original.A.rows)
-                return PREFOS_STATUS_NUMERICAL_ERROR;
-            row_queued[row] = 1;
-            candidate_rows[(*candidate_count)++] = row;
+            if (workspace->dirty_row[row]) continue;
+            if (workspace->row_degrees[row] > 0)
+                --workspace->row_degrees[row];
+            if (workspace->row_degrees[row] <= 1)
+                prefos_internal_queue_trivial_row(
+                    presolver, workspace, row);
         }
     }
     return PREFOS_STATUS_OK;
@@ -75,8 +76,7 @@ static PreFOSStatus collect_newly_fixed_rows(
 
 static PreFOSStatus collect_initial_trivial_rows(
     const PreFOSPresolver *presolver,
-    unsigned char *row_queued, int *candidate_rows,
-    size_t *candidate_count)
+    PreFOSColumnWorkspace *workspace)
 {
     const PreFOSCsrMatrix *matrix = &presolver->original.A;
     size_t row;
@@ -84,8 +84,16 @@ static PreFOSStatus collect_initial_trivial_rows(
     {
         size_t live = 0;
         int position;
-        if (presolver->remove_rows[row] || row_queued[row])
+        if (presolver->remove_rows[row] ||
+            workspace->trivial_row_queued[row])
             continue;
+        if (!workspace->dirty_row[row])
+        {
+            if (workspace->row_degrees[row] <= 1)
+                prefos_internal_queue_trivial_row(
+                    presolver, workspace, (int) row);
+            continue;
+        }
         for (position = matrix->row_pointers[row];
              position < matrix->row_pointers[row + 1] && live <= 1;
              ++position)
@@ -102,12 +110,23 @@ static PreFOSStatus collect_initial_trivial_rows(
             ++live;
         }
         if (live > 1) continue;
-        if (*candidate_count >= presolver->original.A.rows)
-            return PREFOS_STATUS_NUMERICAL_ERROR;
-        row_queued[row] = 1;
-        candidate_rows[(*candidate_count)++] = (int) row;
+        prefos_internal_queue_trivial_row(
+            presolver, workspace, (int) row);
     }
     return PREFOS_STATUS_OK;
+}
+
+static void seed_one_sided_singleton_candidates(
+    const PreFOSPresolver *presolver,
+    PreFOSColumnWorkspace *workspace)
+{
+    size_t column;
+    if (workspace->one_sided_singletons_seeded) return;
+    for (column = 0; column < presolver->original.n; ++column)
+        if (workspace->live_degrees[column] == 1)
+            prefos_internal_queue_singleton_column(
+                presolver, workspace, (int) column);
+    workspace->one_sided_singletons_seeded = 1;
 }
 
 PreFOSStatus prefos_internal_run_fast_fixed_point(
@@ -117,14 +136,16 @@ PreFOSStatus prefos_internal_run_fast_fixed_point(
     PreFOSColumnWorkspace local_workspace;
     PreFOSColumnWorkspace *workspace =
         shared_workspace ? shared_workspace : &local_workspace;
-    unsigned char *row_queued = NULL;
-    int *candidate_rows = NULL;
-    size_t fixed_cursor = presolver->n_fixed_columns;
+    size_t fixed_cursor =
+        shared_workspace
+            ? shared_workspace->fixed_column_cursor
+            : presolver->n_fixed_columns;
     int reuse_workspace =
         shared_workspace != NULL ||
         (!presolver->settings.structural_reductions_gpu &&
          presolver->original.n_box > 0);
     int owns_workspace = reuse_workspace && !shared_workspace;
+    int trace = getenv("PREFOS_TRACE_FAST_FIXED_POINT") != NULL;
     int round;
     ++presolver->stats.fast_fixed_point_passes;
     memset(&local_workspace, 0, sizeof(local_workspace));
@@ -133,37 +154,79 @@ PreFOSStatus prefos_internal_run_fast_fixed_point(
         PreFOSTimestamp start, stop;
         PreFOSStatus status;
         prefos_internal_timer_now(&start);
-        status = shared_workspace
-                     ? prefos_internal_prepare_column_workspace(
-                           presolver, workspace)
-                     : prefos_internal_build_column_workspace(
-                           presolver, workspace);
+        if (shared_workspace)
+        {
+            if (getenv("PREFOS_FORCE_FULL_COLUMN_RESEED"))
+                status = prefos_internal_prepare_column_workspace(
+                    presolver, workspace);
+            else
+            {
+                int objective_dirty;
+                prefos_internal_update_column_live_degrees(
+                    presolver, workspace);
+                objective_dirty =
+                    prefos_internal_queue_transformation_events(
+                        presolver, workspace);
+                if (workspace->fast_pass_started)
+                    prefos_internal_queue_bound_changed_singletons(
+                        presolver, workspace);
+                else
+                    workspace->fast_pass_started = 1;
+                status = objective_dirty
+                             ? prefos_internal_rebuild_column_objective(
+                                   presolver, workspace)
+                             : prefos_internal_sync_column_objective(
+                                   presolver, workspace);
+            }
+        }
+        else
+            status = prefos_internal_build_column_workspace(
+                presolver, workspace);
         prefos_internal_timer_now(&stop);
         presolver->stats.structural_reduction_milliseconds +=
             prefos_internal_timer_elapsed_milliseconds(&start, &stop);
         if (status != PREFOS_STATUS_OK) return status;
-        row_queued = (unsigned char *) calloc(
-            presolver->original.A.rows, sizeof(unsigned char));
-        candidate_rows = (int *) prefos_internal_alloc_array(
-            presolver->original.A.rows, sizeof(int));
-        if (presolver->original.A.rows > 0 &&
-            (!row_queued || !candidate_rows))
-        {
-            free(row_queued);
-            free(candidate_rows);
-            if (owns_workspace)
-                prefos_internal_free_column_workspace(workspace);
-            return PREFOS_STATUS_OUT_OF_MEMORY;
-        }
     }
+    if (shared_workspace && allow_one_sided_singletons)
+        seed_one_sided_singleton_candidates(
+            presolver, workspace);
+    if (trace)
+        fprintf(
+            stderr,
+            "PreFOS fast pass=%zu allow_one_sided=%d "
+            "singleton_queue=%zu dual_queue=%zu fixed=%zu "
+            "substituted=%zu removed_rows=%zu removed_cursor=%zu\n",
+            presolver->stats.fast_fixed_point_passes,
+            allow_one_sided_singletons,
+            reuse_workspace
+                ? workspace->n_singleton_candidate_columns
+                : 0,
+            reuse_workspace
+                ? workspace->n_dual_candidate_columns
+                : 0,
+            presolver->n_fixed_columns,
+            presolver->stats.substituted_free_variables,
+            presolver->n_removed_rows,
+            reuse_workspace
+                ? workspace->removed_row_cursor
+                : 0);
     for (round = 0; round < PREFOS_MAX_FAST_FIXED_POINT_ROUNDS; ++round)
     {
         PreFOSFastProgress before = capture_progress(presolver);
         PreFOSFastProgress after;
         size_t fixed_before_columns = 0, fixed_after_rows = 0;
-        PreFOSStatus status =
-            prefos_internal_find_fixed_box_variables(
-                presolver, &fixed_before_columns);
+        size_t trivial_candidate_count = 0;
+        double trivial_candidate_milliseconds = 0.0;
+        PreFOSTimestamp reduction_start, reduction_stop;
+        PreFOSStatus status;
+        prefos_internal_timer_now(&reduction_start);
+        status = prefos_internal_find_fixed_box_variables(
+            presolver, reuse_workspace ? workspace : NULL,
+            &fixed_before_columns);
+        prefos_internal_timer_now(&reduction_stop);
+        presolver->stats.fixed_box_scan_milliseconds +=
+            prefos_internal_timer_elapsed_milliseconds(
+                &reduction_start, &reduction_stop);
         ++presolver->stats.fast_fixed_point_rounds;
         if (status == PREFOS_STATUS_OK)
         {
@@ -195,40 +258,89 @@ PreFOSStatus prefos_internal_run_fast_fixed_point(
             }
             else
             {
-                size_t candidate_count = 0, candidate;
+                size_t candidate_count, candidate;
                 status = collect_newly_fixed_rows(
-                    presolver, workspace, &fixed_cursor, row_queued,
-                    candidate_rows, &candidate_count);
+                    presolver, workspace, &fixed_cursor);
+                workspace->fixed_column_cursor = fixed_cursor;
                 if (status == PREFOS_STATUS_OK && round == 0 &&
                     full_trivial_scan)
                     status = collect_initial_trivial_rows(
-                        presolver, row_queued,
-                        candidate_rows, &candidate_count);
+                        presolver, workspace);
+                candidate_count =
+                    workspace->n_trivial_candidate_rows;
+                trivial_candidate_count = candidate_count;
                 if (status == PREFOS_STATUS_OK)
+                {
+                    prefos_internal_timer_now(&reduction_start);
                     status = prefos_internal_reduce_trivial_row_candidates(
-                        presolver, candidate_rows, candidate_count);
+                        presolver, workspace->trivial_candidate_rows,
+                        candidate_count);
+                    prefos_internal_timer_now(&reduction_stop);
+                    trivial_candidate_milliseconds =
+                        prefos_internal_timer_elapsed_milliseconds(
+                            &reduction_start, &reduction_stop);
+                    presolver->stats.trivial_candidate_milliseconds +=
+                        trivial_candidate_milliseconds;
+                }
                 for (candidate = 0; candidate < candidate_count; ++candidate)
-                    row_queued[candidate_rows[candidate]] = 0;
+                    workspace->trivial_row_queued[
+                        workspace->trivial_candidate_rows[candidate]] = 0;
+                workspace->n_trivial_candidate_rows = 0;
             }
         }
         if (status == PREFOS_STATUS_OK)
+        {
+            prefos_internal_timer_now(&reduction_start);
             status = prefos_internal_find_fixed_box_variables(
-                presolver, &fixed_after_rows);
+                presolver, reuse_workspace ? workspace : NULL,
+                &fixed_after_rows);
+            prefos_internal_timer_now(&reduction_stop);
+            presolver->stats.fixed_box_scan_milliseconds +=
+                prefos_internal_timer_elapsed_milliseconds(
+                    &reduction_start, &reduction_stop);
+        }
         if (status != PREFOS_STATUS_OK)
         {
-            free(row_queued);
-            free(candidate_rows);
             if (owns_workspace)
                 prefos_internal_free_column_workspace(workspace);
             return status;
         }
+        if (reuse_workspace)
+            (void) prefos_internal_queue_transformation_events(
+                presolver, workspace);
         after = capture_progress(presolver);
+        if (trace)
+            fprintf(
+                stderr,
+                "PreFOS fast pass=%zu round=%d fixed=%zu "
+                "substituted=%zu removed_rows=%zu "
+                "trivial_candidates=%zu trivial_ms=%.3f "
+                "singleton_queue=%zu "
+                "dual_queue=%zu changed=%d "
+                "singleton_examined=%zu singleton_terms=%zu\n",
+                presolver->stats.fast_fixed_point_passes, round,
+                presolver->n_fixed_columns,
+                presolver->stats.substituted_free_variables,
+                presolver->n_removed_rows,
+                trivial_candidate_count,
+                trivial_candidate_milliseconds,
+                reuse_workspace
+                    ? workspace->n_singleton_candidate_columns
+                    : 0,
+                reuse_workspace
+                    ? workspace->n_dual_candidate_columns
+                    : 0,
+                progress_changed(before, after) ||
+                    fixed_before_columns != 0 ||
+                    fixed_after_rows != 0,
+                presolver->stats.singleton_candidates_examined,
+                presolver->stats.singleton_row_terms_scanned);
         if (!progress_changed(before, after) &&
             fixed_before_columns == 0 && fixed_after_rows == 0)
             break;
     }
-    free(row_queued);
-    free(candidate_rows);
+    if (reuse_workspace)
+        workspace->fixed_column_cursor = fixed_cursor;
     if (owns_workspace)
         prefos_internal_free_column_workspace(workspace);
     return PREFOS_STATUS_OK;

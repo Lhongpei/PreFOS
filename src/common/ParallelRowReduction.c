@@ -8,6 +8,7 @@
 
 #include "ParallelRowReduction.h"
 
+#include <float.h>
 #include <math.h>
 
 static int row_start(const PresolveSparseRowView *matrix, int row)
@@ -84,6 +85,14 @@ PresolveParallelReductionStatus presolve_analyze_parallel_row_group(
 
     if (reduction->lower > reduction->upper)
     {
+        double scale =
+            fmax(1.0, fmax(fabs(reduction->lower), fabs(reduction->upper)));
+        double roundoff_tolerance = 32.0 * DBL_EPSILON * scale;
+        if (reduction->lower - reduction->upper <= roundoff_tolerance)
+        {
+            reduction->lower = reduction->upper;
+            return PRESOLVE_PARALLEL_REDUCTION_OK;
+        }
         if (values_close(close_context, reduction->lower, reduction->upper,
                          tolerance))
             return PRESOLVE_PARALLEL_REDUCTION_UNCERTAIN;

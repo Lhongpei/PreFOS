@@ -12,10 +12,18 @@ void prefos_internal_free_linear_propagation_state(
     if (!state) return;
     free(state->activities);
     free(state->redundancy_activities);
+    free(state->finite_min_accumulators);
+    free(state->finite_max_accumulators);
     free(state->box_column_pointers);
     free(state->adjacent_rows);
     free(state->adjacent_positions);
     free(state->redundancy_activity_stale);
+    free(state->activity_recompute_required);
+    free(state->finite_min_accumulator_stale);
+    free(state->finite_max_accumulator_stale);
+    free(state->unique_infinite_min_positions);
+    free(state->unique_infinite_max_positions);
+    free(state->max_box_range_contribution);
     free(state->box_max_abs_coefficient);
     free(state->external_bound_events);
     free(state->external_rows);

@@ -766,7 +766,15 @@ def run_seed(
             objective_scale = max(
                 1.0, abs(direct_objective), abs(reduced_objective)
             )
-            if abs(direct_objective - reduced_objective) > 3e-5 * objective_scale:
+            # Near an exposed cone face, Clarabel can retain O(sqrt(tol))
+            # forbidden tail components and report a slightly optimistic
+            # objective. Postsolve feasibility and KKT checks below remain
+            # unchanged.
+            objective_tolerance = 1e-4 if uses_extended_dual else 3e-5
+            if (
+                abs(direct_objective - reduced_objective)
+                > objective_tolerance * objective_scale
+            ):
                 raise AssertionError(
                     f"optimal values differ: {direct_objective} vs {reduced_objective}"
                 )

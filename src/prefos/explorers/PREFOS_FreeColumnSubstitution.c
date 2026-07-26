@@ -4,30 +4,31 @@
  */
 
 #include "PREFOS_FreeColumnSubstitution.h"
+#include "core/PREFOS_WorkingMatrix.h"
+
+#include <stdio.h>
 
 #define PREFOS_MAX_AGGREGATION_ROW_NNZ (PREFOS_MAX_AGGREGATION_TERMS + 1)
-#ifndef PREFOS_MAX_AGGREGATION_COLUMN_DEGREE
-#define PREFOS_MAX_AGGREGATION_COLUMN_DEGREE 8
-#endif
+#define PREFOS_FREE_AGGREGATION_PREFILTER_NNZ 100000U
+#define PREFOS_FREE_AGGREGATION_NNZ_PER_CANDIDATE 512U
 
-typedef struct
+static int column_contains_row(const int *column_starts,
+                               const int *column_rows,
+                               int column, int row)
 {
-    PreFOSCsrMatrix matrix;
-    double *lower;
-    double *upper;
-} PreFOSWorkingAggregationMatrix;
-
-static int row_contains_column(const PreFOSCsrMatrix *matrix, int row, int column)
-{
-    int position;
-    for (position = matrix->row_pointers[row];
-         position < matrix->row_pointers[row + 1]; ++position)
+    int lower = column_starts[column];
+    int upper = column_starts[column + 1];
+    while (lower < upper)
     {
-        if (matrix->values[position] != 0.0 &&
-            matrix->column_indices[position] == column)
-            return 1;
+        int middle = lower + (upper - lower) / 2;
+        int candidate = column_rows[middle];
+        if (candidate < row)
+            lower = middle + 1;
+        else
+            upper = middle;
     }
-    return 0;
+    return lower < column_starts[column + 1] &&
+           column_rows[lower] == row;
 }
 
 static PreFOSStatus
@@ -106,13 +107,21 @@ static PreFOSStatus reserve_substitution_terms(PreFOSPresolver *presolver,
 static void mark_substitution(PreFOSPresolver *presolver, int column,
                               const int *targets, const double *scales,
                               size_t term_count, double constant, int source_row,
-                              unsigned char *protected_target)
+                              unsigned char *protected_target,
+                              const int *active_rows, size_t active_degree)
 {
     size_t start = presolver->n_substitution_terms;
     size_t term;
-    unsigned char next_depth =
-        (unsigned char) (presolver->substitution_incoming_depth[column] + 1);
+    int creates_fill_in = 0;
+    uint16_t next_depth =
+        (uint16_t) (presolver->substitution_incoming_depth[column] + 1);
 
+    for (term = 0; term < active_degree; ++term)
+        if (active_rows[term] != source_row)
+        {
+            creates_fill_in = 1;
+            break;
+        }
     presolver->is_substituted[column] = 1;
     presolver->substitution_term_count[column] = term_count;
     presolver->substitution_term_start[column] = start;
@@ -125,12 +134,26 @@ static void mark_substitution(PreFOSPresolver *presolver, int column,
         protected_target[target] = 1;
         if (presolver->substitution_incoming_depth[target] < next_depth)
             presolver->substitution_incoming_depth[target] = next_depth;
+        if (creates_fill_in)
+            presolver->substitution_fill_in_targets[target] = 1;
     }
     presolver->n_substitution_terms += term_count;
+    for (term = 0; term < active_degree; ++term)
+        if (active_rows[term] != source_row)
+            prefos_internal_mark_row_requires_materialization(
+                presolver, (size_t) active_rows[term]);
     presolver->variable_to_box[column] = -1;
     prefos_internal_mark_removed_row(presolver, (size_t) source_row);
     ++presolver->stats.substituted_free_variables;
     if (term_count == 2) ++presolver->stats.ternary_substituted_free_variables;
+}
+
+static int column_has_free_input_domain(
+    const PreFOSPresolver *presolver, int box_position)
+{
+    return box_position >= 0 &&
+           presolver->original.box_lower[box_position] == -INFINITY &&
+           presolver->original.box_upper[box_position] == INFINITY;
 }
 
 static int column_can_be_eliminated(const PreFOSPresolver *presolver, int column,
@@ -144,25 +167,31 @@ static int column_can_be_eliminated(const PreFOSPresolver *presolver, int column
            !presolver->affine_protected_columns[column] &&
            presolver->substitution_incoming_depth[column] <
                PREFOS_MAX_SUBSTITUTION_DEPTH &&
-           presolver->working_box_lower[box_position] == -INFINITY &&
-           presolver->working_box_upper[box_position] == INFINITY &&
+           column_has_free_input_domain(presolver, box_position) &&
            !quadratic_column[column] && !factor_column[column];
 }
 
-static size_t active_column_degree(const PreFOSPresolver *presolver,
-                                   const int *column_starts, const int *column_rows,
-                                   int column)
+static int has_basic_free_column_candidate(const PreFOSPresolver *presolver)
 {
-    size_t degree = 0;
-    int position;
-    for (position = column_starts[column]; position < column_starts[column + 1];
-         ++position)
-        if (!presolver->remove_rows[column_rows[position]]) ++degree;
-    return degree;
+    size_t column;
+
+    for (column = 0; column < presolver->original.n; ++column)
+    {
+        int box_position = presolver->variable_to_box[column];
+        if (box_position >= 0 && !presolver->is_fixed[column] &&
+            !presolver->is_substituted[column] &&
+            !presolver->affine_protected_columns[column] &&
+            presolver->substitution_incoming_depth[column] <
+                PREFOS_MAX_SUBSTITUTION_DEPTH &&
+            column_has_free_input_domain(
+                presolver, box_position))
+            return 1;
+    }
+    return 0;
 }
 
 static size_t aggregation_fill(const PreFOSPresolver *presolver,
-                               const PreFOSCsrMatrix *matrix, const int *column_starts,
+                               const int *column_starts,
                                const int *column_rows, int eliminated,
                                int source_row, const int *targets, size_t term_count)
 {
@@ -177,7 +206,10 @@ static size_t aggregation_fill(const PreFOSPresolver *presolver,
         if (adjacent_row == source_row || presolver->remove_rows[adjacent_row])
             continue;
         for (term = 0; term < term_count; ++term)
-            if (!row_contains_column(matrix, adjacent_row, targets[term])) ++absent;
+            if (!column_contains_row(
+                    column_starts, column_rows,
+                    targets[term], adjacent_row))
+                ++absent;
         if (absent > 1)
         {
             fill += absent - 1;
@@ -188,189 +220,14 @@ static size_t aggregation_fill(const PreFOSPresolver *presolver,
     return fill;
 }
 
-static PreFOSStatus accumulate_expanded_column(const PreFOSPresolver *presolver,
-                                            int column, double coefficient,
-                                            size_t depth, double *row_values,
-                                            int *row_marks, int *touched_columns,
-                                            size_t *n_touched, double *shift)
-{
-    size_t term;
-    if (column < 0 || (size_t) column >= presolver->original.n ||
-        depth > PREFOS_MAX_SUBSTITUTION_DEPTH)
-        return PREFOS_STATUS_NUMERICAL_ERROR;
-    if (presolver->is_fixed[column])
-        return prefos_internal_safe_add_product(
-                   shift, coefficient, presolver->fixed_values[column])
-                   ? PREFOS_STATUS_OK
-                   : PREFOS_STATUS_NUMERICAL_ERROR;
-    if (presolver->is_parallel_removed[column]) return PREFOS_STATUS_OK;
-    if (presolver->is_substituted[column])
-    {
-        size_t start = presolver->substitution_term_start[column];
-        size_t count = presolver->substitution_term_count[column];
-        if (count == 0 || start > presolver->n_substitution_terms ||
-            count > presolver->n_substitution_terms - start ||
-            !prefos_internal_safe_add_product(shift, coefficient,
-                                           presolver->substitution_constant[column]))
-            return PREFOS_STATUS_NUMERICAL_ERROR;
-        for (term = 0; term < count; ++term)
-        {
-            double propagated;
-            PreFOSStatus status;
-            if (!prefos_internal_safe_product(
-                    coefficient, presolver->substitution_scales[start + term],
-                    &propagated))
-                return PREFOS_STATUS_NUMERICAL_ERROR;
-            status = accumulate_expanded_column(
-                presolver, presolver->substitution_targets[start + term], propagated,
-                depth + 1, row_values, row_marks, touched_columns, n_touched, shift);
-            if (status != PREFOS_STATUS_OK) return status;
-        }
-        return PREFOS_STATUS_OK;
-    }
-    if (row_marks[column] < 0)
-    {
-        row_marks[column] = 1;
-        row_values[column] = coefficient;
-        touched_columns[(*n_touched)++] = column;
-    }
-    else if (!prefos_internal_safe_add_product(&row_values[column], 1.0, coefficient))
-        return PREFOS_STATUS_NUMERICAL_ERROR;
-    return PREFOS_STATUS_OK;
-}
-
-static void clear_expanded_row(double *row_values, int *row_marks,
-                               const int *touched_columns, size_t n_touched)
-{
-    size_t position;
-    for (position = 0; position < n_touched; ++position)
-    {
-        int column = touched_columns[position];
-        row_values[column] = 0.0;
-        row_marks[column] = -1;
-    }
-}
-
-static void free_working_matrix(PreFOSWorkingAggregationMatrix *working)
-{
-    prefos_internal_free_csr(&working->matrix);
-    free(working->lower);
-    free(working->upper);
-    memset(working, 0, sizeof(*working));
-}
-
-static PreFOSStatus materialize_aggregation_matrix(const PreFOSPresolver *presolver,
-                                                const PreFOSCsrMatrix *source,
-                                                const double *source_lower,
-                                                const double *source_upper,
-                                                PreFOSWorkingAggregationMatrix *target)
-{
-    double *row_values = NULL;
-    int *row_marks = NULL;
-    int *touched_columns = NULL;
-    size_t row, nnz = 0;
-    int write = 0;
-    PreFOSStatus status = PREFOS_STATUS_OK;
-
-    memset(target, 0, sizeof(*target));
-    row_values = (double *) calloc(source->cols, sizeof(double));
-    row_marks = (int *) prefos_internal_alloc_array(source->cols, sizeof(int));
-    touched_columns = (int *) prefos_internal_alloc_array(source->cols, sizeof(int));
-    target->matrix.row_pointers = (int *) calloc(source->rows + 1, sizeof(int));
-    target->lower =
-        (double *) prefos_internal_alloc_array(source->rows, sizeof(double));
-    target->upper =
-        (double *) prefos_internal_alloc_array(source->rows, sizeof(double));
-    if ((source->cols > 0 && (!row_values || !row_marks || !touched_columns)) ||
-        !target->matrix.row_pointers ||
-        (source->rows > 0 && (!target->lower || !target->upper)))
-    {
-        status = PREFOS_STATUS_OUT_OF_MEMORY;
-        goto cleanup;
-    }
-    for (row = 0; row < source->cols; ++row) row_marks[row] = -1;
-
-    for (row = 0; row < source->rows; ++row)
-    {
-        size_t n_touched = 0, position;
-        double shift = 0.0;
-        int p;
-        target->matrix.row_pointers[row] = (int) nnz;
-        target->lower[row] = source_lower[row];
-        target->upper[row] = source_upper[row];
-        if (presolver->remove_rows[row]) continue;
-        for (p = source->row_pointers[row]; p < source->row_pointers[row + 1]; ++p)
-        {
-            if (source->values[p] == 0.0) continue;
-            status = accumulate_expanded_column(
-                presolver, source->column_indices[p], source->values[p], 0,
-                row_values, row_marks, touched_columns, &n_touched, &shift);
-            if (status != PREFOS_STATUS_OK) goto cleanup;
-        }
-        for (position = 0; position < n_touched; ++position)
-            if (row_values[touched_columns[position]] != 0.0) ++nnz;
-        clear_expanded_row(row_values, row_marks, touched_columns, n_touched);
-        target->lower[row] = source_lower[row] - shift;
-        target->upper[row] = source_upper[row] - shift;
-        if (isnan(target->lower[row]) || isnan(target->upper[row]) ||
-            nnz > (size_t) INT_MAX)
-        {
-            status = PREFOS_STATUS_NUMERICAL_ERROR;
-            goto cleanup;
-        }
-    }
-    target->matrix.row_pointers[source->rows] = (int) nnz;
-    target->matrix.values = (double *) prefos_internal_alloc_array(nnz, sizeof(double));
-    target->matrix.column_indices =
-        (int *) prefos_internal_alloc_array(nnz, sizeof(int));
-    if (nnz > 0 && (!target->matrix.values || !target->matrix.column_indices))
-    {
-        status = PREFOS_STATUS_OUT_OF_MEMORY;
-        goto cleanup;
-    }
-
-    for (row = 0; row < source->rows; ++row)
-    {
-        size_t n_touched = 0, position;
-        double shift = 0.0;
-        int p;
-        target->matrix.row_pointers[row] = write;
-        if (presolver->remove_rows[row]) continue;
-        for (p = source->row_pointers[row]; p < source->row_pointers[row + 1]; ++p)
-        {
-            if (source->values[p] == 0.0) continue;
-            status = accumulate_expanded_column(
-                presolver, source->column_indices[p], source->values[p], 0,
-                row_values, row_marks, touched_columns, &n_touched, &shift);
-            if (status != PREFOS_STATUS_OK) goto cleanup;
-        }
-        for (position = 0; position < n_touched; ++position)
-        {
-            int column = touched_columns[position];
-            if (row_values[column] == 0.0) continue;
-            target->matrix.values[write] = row_values[column];
-            target->matrix.column_indices[write++] = column;
-        }
-        clear_expanded_row(row_values, row_marks, touched_columns, n_touched);
-    }
-    target->matrix.row_pointers[source->rows] = write;
-    target->matrix.rows = source->rows;
-    target->matrix.cols = source->cols;
-    target->matrix.nnz = (size_t) write;
-
-cleanup:
-    free(row_values);
-    free(row_marks);
-    free(touched_columns);
-    if (status != PREFOS_STATUS_OK) free_working_matrix(target);
-    return status;
-}
-
 static PreFOSStatus build_column_storage(const PreFOSCsrMatrix *matrix,
+                                      const unsigned char *remove_rows,
                                       int **column_starts_out, int **column_rows_out,
-                                      double **column_coefficients_out)
+                                      double **column_coefficients_out,
+                                      int **active_degrees_out)
 {
     int *column_starts = NULL, *column_rows = NULL, *cursor = NULL;
+    int *active_degrees = NULL;
     double *column_coefficients = NULL;
     size_t row, position;
 
@@ -379,13 +236,17 @@ static PreFOSStatus build_column_storage(const PreFOSCsrMatrix *matrix,
     column_rows = (int *) prefos_internal_alloc_array(matrix->nnz, sizeof(int));
     column_coefficients =
         (double *) prefos_internal_alloc_array(matrix->nnz, sizeof(double));
+    active_degrees =
+        (int *) calloc(matrix->cols, sizeof(int));
     if (!column_starts || (matrix->cols > 0 && !cursor) ||
-        (matrix->nnz > 0 && (!column_rows || !column_coefficients)))
+        (matrix->nnz > 0 && (!column_rows || !column_coefficients)) ||
+        (matrix->cols > 0 && !active_degrees))
     {
         free(column_starts);
         free(cursor);
         free(column_rows);
         free(column_coefficients);
+        free(active_degrees);
         return PREFOS_STATUS_OUT_OF_MEMORY;
     }
     for (position = 0; position < matrix->nnz; ++position)
@@ -405,13 +266,93 @@ static PreFOSStatus build_column_storage(const PreFOSCsrMatrix *matrix,
             write = cursor[column]++;
             column_rows[write] = (int) row;
             column_coefficients[write] = matrix->values[p];
+            if (!remove_rows[row]) ++active_degrees[column];
         }
     }
     free(cursor);
     *column_starts_out = column_starts;
     *column_rows_out = column_rows;
     *column_coefficients_out = column_coefficients;
+    *active_degrees_out = active_degrees;
     return PREFOS_STATUS_OK;
+}
+
+static int trace_free_aggregation(void)
+{
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized)
+    {
+        enabled = getenv("PREFOS_TRACE_FREE_AGGREGATION") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int has_enough_free_aggregation_candidates(
+    const PreFOSPresolver *presolver,
+    const unsigned char *quadratic_column,
+    const unsigned char *factor_column,
+    const unsigned char *protected_target)
+{
+    const PreFOSProblemData *problem = &presolver->original;
+    size_t required, candidates = 0, row;
+    if (problem->A.nnz < PREFOS_FREE_AGGREGATION_PREFILTER_NNZ)
+        return 1;
+    required =
+        (problem->A.nnz +
+         PREFOS_FREE_AGGREGATION_NNZ_PER_CANDIDATE - 1) /
+        PREFOS_FREE_AGGREGATION_NNZ_PER_CANDIDATE;
+    if (required < 256) required = 256;
+    for (row = 0; row < problem->A.rows && candidates < required; ++row)
+    {
+        size_t live = 0;
+        int has_candidate = 0;
+        int p;
+        if (presolver->remove_rows[row] ||
+            !isfinite(presolver->working_constraint_lower[row]) ||
+            presolver->working_constraint_lower[row] !=
+                presolver->working_constraint_upper[row])
+            continue;
+        for (p = problem->A.row_pointers[row];
+             p < problem->A.row_pointers[row + 1]; ++p)
+        {
+            int column = problem->A.column_indices[p];
+            if (problem->A.values[p] == 0.0 ||
+                !prefos_internal_term_is_active_in_row(
+                    presolver, row, column) ||
+                presolver->is_fixed[column] ||
+                presolver->is_parallel_removed[column])
+                continue;
+            if (presolver->is_substituted[column])
+            {
+                live = (size_t)
+                    presolver->settings.max_aggregation_terms + 2;
+                break;
+            }
+            ++live;
+            if (live >
+                (size_t) presolver->settings.max_aggregation_terms + 1)
+                break;
+            if (column_can_be_eliminated(
+                    presolver, column, quadratic_column,
+                    factor_column, protected_target))
+                has_candidate = 1;
+        }
+        if (live >= 2 &&
+            live <=
+                (size_t) presolver->settings.max_aggregation_terms + 1 &&
+            has_candidate)
+            ++candidates;
+    }
+    if (trace_free_aggregation())
+        fprintf(
+            stderr,
+            "PreFOS free aggregation prefilter candidates=%zu "
+            "required=%zu nnz=%zu decision=%s\n",
+            candidates, required, problem->A.nnz,
+            candidates >= required ? "run" : "skip");
+    return candidates >= required;
 }
 
 PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
@@ -420,11 +361,13 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
     const PreFOSCsrMatrix *current_matrix = &problem->A;
     const double *current_lower = presolver->working_constraint_lower;
     const double *current_upper = presolver->working_constraint_upper;
-    PreFOSWorkingAggregationMatrix owned_current;
+    PreFOSWorkingMatrix owned_current;
     unsigned char *quadratic_column = NULL;
     unsigned char *factor_column = NULL;
     unsigned char *protected_target = NULL;
     double *working_objective = NULL;
+    int *record_rows = NULL;
+    double *record_coefficients = NULL;
     double working_objective_offset = 0.0;
     size_t row, round;
     PreFOSStatus status = PREFOS_STATUS_OK;
@@ -433,23 +376,17 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
     if (!presolver->settings.free_column_substitution || problem->n_box == 0 ||
         problem->A.rows == 0)
         return PREFOS_STATUS_OK;
+    if (!has_basic_free_column_candidate(presolver))
+        return PREFOS_STATUS_OK;
 
     quadratic_column = (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     factor_column = (unsigned char *) calloc(problem->n, sizeof(unsigned char));
     protected_target = (unsigned char *) calloc(problem->n, sizeof(unsigned char));
-    working_objective =
-        (double *) prefos_internal_alloc_array(problem->n, sizeof(double));
-    if (problem->n > 0 && (!quadratic_column || !factor_column ||
-                           !protected_target || !working_objective))
+    if (problem->n > 0 &&
+        (!quadratic_column || !factor_column || !protected_target))
     {
         status = PREFOS_STATUS_OUT_OF_MEMORY;
         goto cleanup;
-    }
-    if (problem->n > 0)
-    {
-        status = prefos_internal_expand_linear_objective(
-            presolver, working_objective, &working_objective_offset);
-        if (status != PREFOS_STATUS_OK) goto cleanup;
     }
 
     for (row = 0; row < problem->Q.rows; ++row)
@@ -485,6 +422,31 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
         }
         if (!has_candidate) goto cleanup;
     }
+    if (!has_enough_free_aggregation_candidates(
+            presolver, quadratic_column, factor_column,
+            protected_target))
+        goto cleanup;
+
+    working_objective =
+        (double *) prefos_internal_alloc_array(problem->n, sizeof(double));
+    record_rows = (int *) prefos_internal_alloc_array(
+        (size_t) presolver->settings.max_aggregation_column_degree,
+        sizeof(int));
+    record_coefficients = (double *) prefos_internal_alloc_array(
+        (size_t) presolver->settings.max_aggregation_column_degree,
+        sizeof(double));
+    if ((problem->n > 0 && !working_objective) ||
+        !record_rows || !record_coefficients)
+    {
+        status = PREFOS_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+    if (problem->n > 0)
+    {
+        status = prefos_internal_expand_linear_objective(
+            presolver, working_objective, &working_objective_offset);
+        if (status != PREFOS_STATUS_OK) goto cleanup;
+    }
 
     if (presolver->n_fixed_columns > 0 ||
         presolver->n_residual_row_substitutions > 0 ||
@@ -492,7 +454,7 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
         presolver->n_parallel_column_reductions > 0 ||
         presolver->n_affine_face_substitutions > 0)
     {
-        status = materialize_aggregation_matrix(
+        status = prefos_internal_materialize_working_matrix(
             presolver, current_matrix, current_lower, current_upper,
             &owned_current);
         if (status != PREFOS_STATUS_OK) goto cleanup;
@@ -505,12 +467,15 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
          round < (size_t) presolver->settings.max_aggregation_rounds; ++round)
     {
         int *column_starts = NULL, *column_rows = NULL;
+        int *active_degrees = NULL;
         double *column_coefficients = NULL;
         size_t accepted = 0;
 
         memset(protected_target, 0, problem->n * sizeof(unsigned char));
-        status = build_column_storage(current_matrix, &column_starts, &column_rows,
-                                      &column_coefficients);
+        status = build_column_storage(
+            current_matrix, presolver->remove_rows,
+            &column_starts, &column_rows,
+            &column_coefficients, &active_degrees);
         if (status != PREFOS_STATUS_OK) goto cleanup;
 
         for (row = 0; row < current_matrix->rows; ++row)
@@ -560,8 +525,7 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
                                               quadratic_column, factor_column,
                                               protected_target))
                     continue;
-                active_degree = active_column_degree(presolver, column_starts,
-                                                     column_rows, eliminated);
+                active_degree = (size_t) active_degrees[eliminated];
                 if (active_degree == 0 ||
                     active_degree >
                         (size_t) presolver->settings.max_aggregation_column_degree)
@@ -597,9 +561,9 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
                 if (!isfinite(value) || fabsl(value) > (long double) DBL_MAX)
                     continue;
                 constant = (double) value;
-                fill = aggregation_fill(presolver, current_matrix, column_starts,
-                                        column_rows, eliminated, (int) row, targets,
-                                        term_count);
+                fill = aggregation_fill(
+                    presolver, column_starts, column_rows,
+                    eliminated, (int) row, targets, term_count);
                 if (fill > (size_t) presolver->settings.max_aggregation_fill)
                     continue;
                 if (fill < best_fill ||
@@ -627,8 +591,6 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
             }
             if (best_eliminated >= 0)
             {
-                int record_rows[PREFOS_MAX_AGGREGATION_COLUMN_DEGREE];
-                double record_coefficients[PREFOS_MAX_AGGREGATION_COLUMN_DEGREE];
                 double updated_objective[PREFOS_MAX_AGGREGATION_TERMS];
                 size_t record_degree = 0, term;
                 int adjacent;
@@ -638,7 +600,9 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
                 {
                     int adjacent_row = column_rows[adjacent];
                     if (presolver->remove_rows[adjacent_row]) continue;
-                    if (record_degree >= PREFOS_MAX_AGGREGATION_COLUMN_DEGREE)
+                    if (record_degree >=
+                        (size_t) presolver->settings
+                            .max_aggregation_column_degree)
                     {
                         status = PREFOS_STATUS_NUMERICAL_ERROR;
                         break;
@@ -670,7 +634,16 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
                 if (status != PREFOS_STATUS_OK) break;
                 mark_substitution(presolver, best_eliminated, best_targets,
                                   best_scales, best_term_count, best_constant,
-                                  (int) row, protected_target);
+                                  (int) row, protected_target, record_rows,
+                                  record_degree);
+                for (p = current_matrix->row_pointers[row];
+                     p < current_matrix->row_pointers[row + 1]; ++p)
+                {
+                    int column = current_matrix->column_indices[p];
+                    if (current_matrix->values[p] != 0.0 &&
+                        active_degrees[column] > 0)
+                        --active_degrees[column];
+                }
                 working_objective[best_eliminated] = 0.0;
                 for (term = 0; term < best_term_count; ++term)
                     working_objective[best_targets[term]] = updated_objective[term];
@@ -680,17 +653,18 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
         free(column_starts);
         free(column_rows);
         free(column_coefficients);
+        free(active_degrees);
         if (status != PREFOS_STATUS_OK) goto cleanup;
         if (accepted == 0 ||
             round + 1 ==
                 (size_t) presolver->settings.max_aggregation_rounds)
             break;
         {
-            PreFOSWorkingAggregationMatrix next;
-            status = materialize_aggregation_matrix(
+            PreFOSWorkingMatrix next;
+            status = prefos_internal_materialize_working_matrix(
                 presolver, current_matrix, current_lower, current_upper, &next);
             if (status != PREFOS_STATUS_OK) goto cleanup;
-            free_working_matrix(&owned_current);
+            prefos_internal_free_working_matrix(&owned_current);
             owned_current = next;
             current_matrix = &owned_current.matrix;
             current_lower = owned_current.lower;
@@ -699,10 +673,12 @@ PreFOSStatus prefos_internal_substitute_free_columns(PreFOSPresolver *presolver)
     }
 
 cleanup:
-    free_working_matrix(&owned_current);
+    prefos_internal_free_working_matrix(&owned_current);
     free(quadratic_column);
     free(factor_column);
     free(protected_target);
     free(working_objective);
+    free(record_rows);
+    free(record_coefficients);
     return status;
 }

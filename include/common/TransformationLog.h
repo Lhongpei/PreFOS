@@ -18,12 +18,16 @@ typedef struct
 {
     int row;
     int column;
+    size_t source_row_record_index;
+    size_t previous_same_side_record_index;
     double previous_bound;
     double implied_bound;
     double opposite_bound;
     uint8_t is_lower;
     uint8_t has_previous_bound;
     uint8_t has_opposite_bound;
+    uint8_t has_source_row_record;
+    uint8_t has_previous_same_side_record;
 } PresolveBoundChangeRecord;
 
 typedef enum
@@ -114,6 +118,21 @@ typedef struct
     size_t record_index;
 } PresolveTransformationEvent;
 
+typedef union
+{
+    long double long_double_value;
+    void *pointer_value;
+    uint64_t integer_value;
+} PresolveTransformationArenaUnit;
+
+typedef struct PresolveTransformationArenaChunk
+{
+    struct PresolveTransformationArenaChunk *next;
+    size_t used;
+    size_t capacity;
+    PresolveTransformationArenaUnit storage[1];
+} PresolveTransformationArenaChunk;
+
 typedef struct
 {
     PresolveBoundChangeRecord *bound_changes;
@@ -131,6 +150,7 @@ typedef struct
     PresolveTransformationEvent *events;
     size_t n_events;
     size_t event_capacity;
+    PresolveTransformationArenaChunk *payload_chunks;
 } PresolveTransformationLog;
 
 static inline void presolve_transformation_log_init(PresolveTransformationLog *log)
@@ -140,28 +160,61 @@ static inline void presolve_transformation_log_init(PresolveTransformationLog *l
 
 static inline void presolve_transformation_log_free(PresolveTransformationLog *log)
 {
-    size_t i;
+    PresolveTransformationArenaChunk *chunk;
     if (!log) return;
     free(log->bound_changes);
-    for (i = 0; i < log->n_row_transformations; ++i)
-    {
-        free(log->row_transformations[i].indices);
-        free(log->row_transformations[i].coefficients);
-    }
     free(log->row_transformations);
-    for (i = 0; i < log->n_column_transformations; ++i)
+    chunk = log->payload_chunks;
+    while (chunk)
     {
-        free(log->column_transformations[i].indices);
-        free(log->column_transformations[i].coefficients);
-        free(log->column_transformations[i].row_starts);
-        free(log->column_transformations[i].row_sides);
-        free(log->column_transformations[i].affine_indices);
-        free(log->column_transformations[i].affine_coefficients);
+        PresolveTransformationArenaChunk *next = chunk->next;
+        free(chunk);
+        chunk = next;
     }
     free(log->column_transformations);
     free(log->cone_transformations);
     free(log->events);
     memset(log, 0, sizeof(*log));
+}
+
+static inline void *presolve_transformation_log_alloc_payload(
+    PresolveTransformationLog *log, size_t bytes)
+{
+    const size_t unit_size = sizeof(PresolveTransformationArenaUnit);
+    const size_t default_units =
+        (65536U + sizeof(PresolveTransformationArenaUnit) - 1U) /
+        sizeof(PresolveTransformationArenaUnit);
+    PresolveTransformationArenaChunk *chunk =
+        log->payload_chunks;
+    size_t units, capacity, allocation_size;
+    void *result;
+
+    if (bytes == 0) return NULL;
+    if (bytes > SIZE_MAX - (unit_size - 1U)) return NULL;
+    units = (bytes + unit_size - 1U) / unit_size;
+    if (!chunk || units > chunk->capacity - chunk->used)
+    {
+        capacity = units > default_units ? units : default_units;
+        if (capacity >
+            (SIZE_MAX - offsetof(
+                            PresolveTransformationArenaChunk,
+                            storage)) /
+                unit_size)
+            return NULL;
+        allocation_size =
+            offsetof(PresolveTransformationArenaChunk, storage) +
+            capacity * unit_size;
+        chunk = (PresolveTransformationArenaChunk *)
+            malloc(allocation_size);
+        if (!chunk) return NULL;
+        chunk->next = log->payload_chunks;
+        chunk->used = 0;
+        chunk->capacity = capacity;
+        log->payload_chunks = chunk;
+    }
+    result = (void *) (chunk->storage + chunk->used);
+    chunk->used += units;
+    return result;
 }
 
 static inline int
@@ -292,7 +345,8 @@ static inline int presolve_transformation_log_assign_recent_bound_changes(
 }
 
 static inline int presolve_transformation_log_append_row_transformation(
-    PresolveTransformationLog *log, const PresolveRowTransformationRecord *record,
+    PresolveTransformationLog *log,
+    const PresolveRowTransformationRecord *record,
     size_t *record_index)
 {
     PresolveRowTransformationRecord copy = *record;
@@ -306,27 +360,23 @@ static inline int presolve_transformation_log_append_row_transformation(
             record->length > SIZE_MAX / sizeof(int) ||
             record->length > SIZE_MAX / sizeof(double))
             return 0;
+    }
+    if (!presolve_transformation_log_reserve_row_transformations(log) ||
+        !presolve_transformation_log_reserve_events(log))
+        return 0;
+    if (record->length > 0)
+    {
         bytes = record->length * sizeof(int);
-        copy.indices = (int *) malloc(bytes);
+        copy.indices = (int *)
+            presolve_transformation_log_alloc_payload(log, bytes);
         if (!copy.indices) return 0;
         memcpy(copy.indices, record->indices, bytes);
 
         bytes = record->length * sizeof(double);
-        copy.coefficients = (double *) malloc(bytes);
-        if (!copy.coefficients)
-        {
-            free(copy.indices);
-            return 0;
-        }
+        copy.coefficients = (double *)
+            presolve_transformation_log_alloc_payload(log, bytes);
+        if (!copy.coefficients) return 0;
         memcpy(copy.coefficients, record->coefficients, bytes);
-    }
-
-    if (!presolve_transformation_log_reserve_row_transformations(log) ||
-        !presolve_transformation_log_reserve_events(log))
-    {
-        free(copy.indices);
-        free(copy.coefficients);
-        return 0;
     }
 
     index = log->n_row_transformations;
@@ -334,6 +384,50 @@ static inline int presolve_transformation_log_append_row_transformation(
     log->row_transformations[log->n_row_transformations++] = copy;
     log->events[log->n_events++] =
         (PresolveTransformationEvent) {PRESOLVE_TRANSFORMATION_ROW, index};
+    return 1;
+}
+
+/*
+ * Store a sparse row as supporting data for another transformation. It is
+ * deliberately absent from the event stream because replaying the owner is
+ * sufficient.
+ */
+static inline int presolve_transformation_log_store_row_source(
+    PresolveTransformationLog *log,
+    const PresolveRowTransformationRecord *record,
+    size_t *record_index)
+{
+    PresolveRowTransformationRecord copy = *record;
+    size_t bytes;
+
+    copy.indices = NULL;
+    copy.coefficients = NULL;
+    if (record->length > 0)
+    {
+        if (!record->indices || !record->coefficients ||
+            record->length > SIZE_MAX / sizeof(int) ||
+            record->length > SIZE_MAX / sizeof(double))
+            return 0;
+    }
+    if (!presolve_transformation_log_reserve_row_transformations(log))
+        return 0;
+    if (record->length > 0)
+    {
+        bytes = record->length * sizeof(int);
+        copy.indices = (int *)
+            presolve_transformation_log_alloc_payload(log, bytes);
+        if (!copy.indices) return 0;
+        memcpy(copy.indices, record->indices, bytes);
+
+        bytes = record->length * sizeof(double);
+        copy.coefficients = (double *)
+            presolve_transformation_log_alloc_payload(log, bytes);
+        if (!copy.coefficients) return 0;
+        memcpy(copy.coefficients, record->coefficients, bytes);
+    }
+
+    if (record_index) *record_index = log->n_row_transformations;
+    log->row_transformations[log->n_row_transformations++] = copy;
     return 1;
 }
 
@@ -372,17 +466,6 @@ static inline int presolve_transformation_log_append_column_transformation(
             record->length > SIZE_MAX / sizeof(int) ||
             record->length > SIZE_MAX / sizeof(double))
             return 0;
-        copy.indices = (int *) malloc(record->length * sizeof(int));
-        copy.coefficients = (double *) malloc(record->length * sizeof(double));
-        if (!copy.indices || !copy.coefficients)
-        {
-            free(copy.indices);
-            free(copy.coefficients);
-            return 0;
-        }
-        memcpy(copy.indices, record->indices, record->length * sizeof(int));
-        memcpy(copy.coefficients, record->coefficients,
-               record->length * sizeof(double));
     }
     if (record->n_rows > 0)
     {
@@ -392,74 +475,63 @@ static inline int presolve_transformation_log_append_column_transformation(
             record->n_rows > SIZE_MAX / sizeof(double) ||
             record->row_starts[0] != 0 ||
             (size_t) record->row_starts[record->n_rows] != record->length)
-        {
-            free(copy.indices);
-            free(copy.coefficients);
             return 0;
-        }
         for (position = 0; position < record->n_rows; ++position)
             if (record->row_starts[position] < 0 ||
                 record->row_starts[position] > record->row_starts[position + 1])
-            {
-                free(copy.indices);
-                free(copy.coefficients);
                 return 0;
-            }
-        copy.row_starts = (int *) malloc((record->n_rows + 1) * sizeof(int));
-        copy.row_sides = (double *) malloc(record->n_rows * sizeof(double));
-        if (!copy.row_starts || !copy.row_sides)
-        {
-            free(copy.indices);
-            free(copy.coefficients);
-            free(copy.row_starts);
-            free(copy.row_sides);
-            return 0;
-        }
-        memcpy(copy.row_starts, record->row_starts,
-               (record->n_rows + 1) * sizeof(int));
-        memcpy(copy.row_sides, record->row_sides, record->n_rows * sizeof(double));
     }
     if (record->affine_length > 0)
     {
         if (!record->affine_indices || !record->affine_coefficients ||
             record->affine_length > SIZE_MAX / sizeof(int) ||
             record->affine_length > SIZE_MAX / sizeof(double))
-        {
-            free(copy.indices);
-            free(copy.coefficients);
-            free(copy.row_starts);
-            free(copy.row_sides);
             return 0;
-        }
+    }
+    if (!presolve_transformation_log_reserve_column_transformations(log) ||
+        !presolve_transformation_log_reserve_events(log))
+        return 0;
+    if (record->length > 0)
+    {
+        copy.indices = (int *)
+            presolve_transformation_log_alloc_payload(
+                log, record->length * sizeof(int));
+        copy.coefficients = (double *)
+            presolve_transformation_log_alloc_payload(
+                log, record->length * sizeof(double));
+        if (!copy.indices || !copy.coefficients) return 0;
+        memcpy(copy.indices, record->indices,
+               record->length * sizeof(int));
+        memcpy(copy.coefficients, record->coefficients,
+               record->length * sizeof(double));
+    }
+    if (record->n_rows > 0)
+    {
+        copy.row_starts = (int *)
+            presolve_transformation_log_alloc_payload(
+                log, (record->n_rows + 1) * sizeof(int));
+        copy.row_sides = (double *)
+            presolve_transformation_log_alloc_payload(
+                log, record->n_rows * sizeof(double));
+        if (!copy.row_starts || !copy.row_sides) return 0;
+        memcpy(copy.row_starts, record->row_starts,
+               (record->n_rows + 1) * sizeof(int));
+        memcpy(copy.row_sides, record->row_sides,
+               record->n_rows * sizeof(double));
+    }
+    if (record->affine_length > 0)
+    {
         copy.affine_indices =
-            (int *) malloc(record->affine_length * sizeof(int));
+            (int *) presolve_transformation_log_alloc_payload(
+                log, record->affine_length * sizeof(int));
         copy.affine_coefficients =
-            (double *) malloc(record->affine_length * sizeof(double));
-        if (!copy.affine_indices || !copy.affine_coefficients)
-        {
-            free(copy.indices);
-            free(copy.coefficients);
-            free(copy.row_starts);
-            free(copy.row_sides);
-            free(copy.affine_indices);
-            free(copy.affine_coefficients);
-            return 0;
-        }
+            (double *) presolve_transformation_log_alloc_payload(
+                log, record->affine_length * sizeof(double));
+        if (!copy.affine_indices || !copy.affine_coefficients) return 0;
         memcpy(copy.affine_indices, record->affine_indices,
                record->affine_length * sizeof(int));
         memcpy(copy.affine_coefficients, record->affine_coefficients,
                record->affine_length * sizeof(double));
-    }
-    if (!presolve_transformation_log_reserve_column_transformations(log) ||
-        !presolve_transformation_log_reserve_events(log))
-    {
-        free(copy.indices);
-        free(copy.coefficients);
-        free(copy.row_starts);
-        free(copy.row_sides);
-        free(copy.affine_indices);
-        free(copy.affine_coefficients);
-        return 0;
     }
     index = log->n_column_transformations;
     if (record_index) *record_index = index;

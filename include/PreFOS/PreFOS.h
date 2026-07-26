@@ -164,6 +164,7 @@ extern "C"
         int free_column_substitution;
         /* Number of retained terms; source equality width is one larger. */
         int max_aggregation_terms;
+        /* Maximum pivot-column degree for low-fill equality aggregation. */
         int max_aggregation_column_degree;
         int max_aggregation_fill;
         int max_aggregation_rounds;
@@ -172,7 +173,7 @@ extern "C"
         int max_linear_propagation_rounds;
         /* CUDA bulk linear and cone propagation; ignored without CUDA. */
         int linear_propagation_gpu;
-        /* Zero work ratio or zero stale rounds disables that adaptive limit. */
+        /* Per structural wave; zero work ratio or stale rounds disables it. */
         double linear_propagation_max_work_ratio;
         double linear_propagation_min_changes_per_million;
         int linear_propagation_max_stale_rounds;
@@ -209,6 +210,12 @@ extern "C"
         int remove_empty_columns;
         int singleton_column_reduction;
         int bounded_doubleton_substitution;
+        /*
+         * Optional work cap for bounded-doubleton pivots.
+         * The default INT_MAX accepts every eligible pivot because replacing
+         * one doubleton column by the other does not increase total A nnz.
+         */
+        int max_bounded_doubleton_column_degree;
         int dual_fixing;
         int parallel_column_reduction;
         /* Remove row-implied box sides in the interior-point bound policy. */
@@ -438,6 +445,14 @@ extern "C"
         size_t linear_cache_reuses;
         size_t linear_cache_bound_changes;
         size_t linear_cache_rows_scheduled;
+        double column_fixing_milliseconds;
+        double singleton_column_milliseconds;
+        double fixed_box_scan_milliseconds;
+        double trivial_candidate_milliseconds;
+        size_t singleton_candidates_examined;
+        size_t singleton_row_terms_scanned;
+        double singleton_row_scan_milliseconds;
+        double singleton_substitution_milliseconds;
     } PreFOSStats;
 
     typedef struct

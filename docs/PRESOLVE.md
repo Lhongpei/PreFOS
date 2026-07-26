@@ -92,10 +92,11 @@ relative improvement thresholds, while `prefos_strict_settings()` sets both
 thresholds to zero for equivalence tests.
 
 The default propagation policy also applies a deterministic sparse-work budget.
-`linear_propagation_max_work_ratio` bounds activity construction, row scans,
-and incremental activity updates relative to `nnz(A)`; a one-million-work-unit
-floor lets small propagation chains reach a fixed point. Consecutive rounds
-below `linear_propagation_min_changes_per_million` stop after
+For each structural fixed-point wave, `linear_propagation_max_work_ratio`
+bounds activity construction, row scans, and incremental activity updates
+relative to `nnz(A)`; a one-million-work-unit floor lets small propagation
+chains reach a fixed point. Consecutive rounds below
+`linear_propagation_min_changes_per_million` stop after
 `linear_propagation_max_stale_rounds`. A zero work ratio or zero stale-round
 limit disables that adaptive guard, and `prefos_strict_settings()` disables both.
 Statistics expose event/full rounds, work, fallback count, and budget/stale
@@ -104,11 +105,12 @@ stop counts.
 Parallel-row detection has a separate density guard because scale-invariant
 coefficient hashing is comparatively expensive on very long rows.
 `parallel_row_max_average_nnz` skips this optional pass when the original
-matrix average exceeds the configured width. The default is 256, while zero
-forces full detection. `parallel_row_budget_skips` and
+matrix average exceeds the configured width. The default is 32768; CPU models
+above average row width 256 first use a support-only potential-yield filter,
+while zero forces full detection. `parallel_row_budget_skips` and
 `parallel_row_detection_milliseconds` report the decision and executed work.
 Activity-based redundant-row checks use the independent
-`redundant_row_max_average_nnz` guard with the same default and zero semantics;
+`redundant_row_max_average_nnz` guard with default 1024 and the same zero semantics;
 `redundant_row_activity_budget_skips` records skipped passes.
 
 ## Linear Column Reductions
@@ -357,6 +359,13 @@ control the structural and numerical budget. Up to four retained terms (a
 five-nonzero source equality) are supported. The wider setting is intentionally
 not the default: it reduces some benchmark dimensions further but can increase
 factorization fill for direct solvers.
+
+Bounded doubleton equalities have a separate optional
+`max_bounded_doubleton_column_degree` work cap. It defaults to `INT_MAX`:
+replacing one column by the other in a two-term equality adds no net matrix
+nonzeros, so wide pivots are normally profitable. Applications that need a
+strict latency budget can lower this setting without constraining general
+free-column aggregation.
 
 ## Cone Propagation
 

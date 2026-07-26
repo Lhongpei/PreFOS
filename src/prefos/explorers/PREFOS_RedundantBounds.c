@@ -127,7 +127,11 @@ prefos_internal_remove_redundant_box_bounds(PreFOSPresolver *presolver)
                         row_implies_box_side(presolver, (size_t) row, column,
                                              lower, 1))
                     {
+                        prefos_internal_clear_box_bound_provenance(
+                            presolver, column, 1);
                         presolver->working_box_lower[box] = -INFINITY;
+                        prefos_internal_mark_fixed_box_dirty(
+                            presolver, column);
                         ++presolver->stats.removed_redundant_box_lower_bounds;
                         changed = 1;
                         break;
@@ -144,7 +148,11 @@ prefos_internal_remove_redundant_box_bounds(PreFOSPresolver *presolver)
                         row_implies_box_side(presolver, (size_t) row, column,
                                              upper, 0))
                     {
+                        prefos_internal_clear_box_bound_provenance(
+                            presolver, column, 0);
                         presolver->working_box_upper[box] = INFINITY;
+                        prefos_internal_mark_fixed_box_dirty(
+                            presolver, column);
                         ++presolver->stats.removed_redundant_box_upper_bounds;
                         changed = 1;
                         break;

@@ -108,6 +108,7 @@ class Settings(ct.Structure):
         ("remove_empty_columns", ct.c_int),
         ("singleton_column_reduction", ct.c_int),
         ("bounded_doubleton_substitution", ct.c_int),
+        ("max_bounded_doubleton_column_degree", ct.c_int),
         ("dual_fixing", ct.c_int),
         ("parallel_column_reduction", ct.c_int),
         ("remove_redundant_bounds", ct.c_int),

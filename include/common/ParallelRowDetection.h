@@ -34,12 +34,29 @@ int presolve_compute_parallel_row_hashes(
     const PresolveSparseRowView *matrix, PresolveRowIsActive row_is_active,
     const void *active_context, int *support_hashes, int *coefficient_hashes);
 
+int presolve_compute_parallel_row_hash_keys(
+    const PresolveSparseRowView *matrix, const int *rows, size_t count,
+    int *support_hashes, int *coefficient_hashes);
+
 int presolve_find_parallel_rows(
     const PresolveSparseRowView *matrix, PresolveRowIsActive row_is_active,
-    const void *active_context, double tolerance, PresolveSortRows sort_rows,
-    int *parallel_rows, int *support_hashes, int *coefficient_hashes,
-    int *sort_auxiliary, int *group_starts, size_t group_starts_capacity,
-    size_t *n_groups);
+    const void *active_context, double tolerance, int support_only,
+    PresolveSortRows sort_rows, int *parallel_rows, int *support_hashes,
+    int *coefficient_hashes, int *sort_auxiliary, int *group_starts,
+    size_t group_starts_capacity, size_t *n_groups);
+
+int presolve_find_parallel_rows_in_set(
+    const PresolveSparseRowView *matrix, double tolerance, int support_only,
+    PresolveSortRows sort_rows, int *parallel_rows, size_t active_count,
+    int *support_hashes, int *coefficient_hashes, int *sort_auxiliary,
+    int *group_starts, size_t group_starts_capacity, size_t *n_groups);
+
+int presolve_find_parallel_rows_in_set_with_sorted_copy(
+    const PresolveSparseRowView *matrix, double tolerance, int support_only,
+    PresolveSortRows sort_rows, int *parallel_rows, size_t active_count,
+    int *support_hashes, int *coefficient_hashes, int *sort_auxiliary,
+    int *sorted_active_rows, size_t *sorted_active_count,
+    int *group_starts, size_t group_starts_capacity, size_t *n_groups);
 
 int presolve_collect_parallel_row_groups(
     const PresolveSparseRowView *matrix, double tolerance,

@@ -109,6 +109,8 @@ static PreFOSStatus extract_singleton_cone_envelopes(PreFOSPresolver *presolver)
         status =
             update_cone_envelope_upper(presolver, column, implied_upper, &changed);
         if (status != PREFOS_STATUS_OK) return status;
+        if (changed && presolver->nonmaterialized_bound_source_rows)
+            presolver->nonmaterialized_bound_source_rows[row] = 1;
     }
     return PREFOS_STATUS_OK;
 }

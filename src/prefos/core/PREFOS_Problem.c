@@ -4,6 +4,7 @@
  */
 
 #include "PREFOS_Internal.h"
+#include "PREFOS_WorkingMatrix.h"
 #include "explorers/PREFOS_CudaBackend.h"
 #include "explorers/PREFOS_LinearPropagation.h"
 
@@ -354,7 +355,7 @@ static PreFOSStatus validate_problem(const PreFOSProblemData *problem,
         settings->max_aggregation_terms < 1 ||
         settings->max_aggregation_terms > PREFOS_MAX_AGGREGATION_TERMS ||
         settings->max_aggregation_column_degree < 1 ||
-        settings->max_aggregation_column_degree > 8 ||
+        settings->max_bounded_doubleton_column_degree < 1 ||
         settings->max_aggregation_fill < 0 || settings->max_aggregation_fill > 8 ||
         settings->max_aggregation_rounds < 1 ||
         settings->max_aggregation_rounds > 8 ||
@@ -776,8 +777,8 @@ PreFOSSettings prefos_default_settings(void)
     settings.remove_redundant_rows = 1;
     settings.free_column_substitution = 1;
     settings.max_aggregation_terms = 2;
-    settings.max_aggregation_column_degree = 8;
-    settings.max_aggregation_fill = 8;
+    settings.max_aggregation_column_degree = 64;
+    settings.max_aggregation_fill = 2;
     settings.max_aggregation_rounds = 4;
     settings.max_aggregation_scale = 1e3;
     settings.linear_propagation = 1;
@@ -799,7 +800,7 @@ PreFOSSettings prefos_default_settings(void)
     settings.power_face_reduction = 1;
     settings.finite_bound_improvement_absolute = 1e-3;
     settings.finite_bound_improvement_relative = 1e-2;
-    settings.event_queue_max_average_column_degree = 64.0;
+    settings.event_queue_max_average_column_degree = 512.0;
     settings.event_queue_activity_update_ratio = 4.0;
     settings.propagated_bound_policy = PREFOS_PROPAGATED_BOUND_POLICY_FIRST_ORDER;
     settings.affine_cone_coordinate_aggregation = 0;
@@ -808,12 +809,13 @@ PreFOSSettings prefos_default_settings(void)
     settings.remove_empty_columns = 1;
     settings.singleton_column_reduction = 1;
     settings.bounded_doubleton_substitution = 1;
+    settings.max_bounded_doubleton_column_degree = INT_MAX;
     settings.dual_fixing = 1;
     settings.parallel_column_reduction = 1;
     settings.remove_redundant_bounds = 1;
     settings.structural_reductions_gpu = 0;
-    settings.parallel_row_max_average_nnz = 256.0;
-    settings.redundant_row_max_average_nnz = 256.0;
+    settings.parallel_row_max_average_nnz = 32768.0;
+    settings.redundant_row_max_average_nnz = 1024.0;
     return settings;
 }
 
@@ -880,6 +882,7 @@ void prefos_free_presolver(PreFOSPresolver *presolver)
     if (!presolver) return;
     prefos_internal_free_linear_propagation_cache(presolver);
     prefos_internal_cuda_workspace_release(presolver);
+    prefos_internal_clear_working_matrix_cache(presolver);
     prefos_internal_free_psd_face_reductions(presolver->psd_face_reductions,
                                           presolver->original.n_cones);
     free_problem_data(&presolver->original);
@@ -893,20 +896,30 @@ void prefos_free_presolver(PreFOSPresolver *presolver)
     free(presolver->is_parallel_removed);
     free(presolver->substitution_term_count);
     free(presolver->substitution_incoming_depth);
+    free(presolver->substitution_fill_in_targets);
     free(presolver->substitution_keeps_source_row);
     free(presolver->substitution_term_start);
     free(presolver->substitution_source_row);
     free(presolver->residual_source_column);
+    free(presolver->rows_require_materialization);
+    free(presolver->materialization_row_log);
+    free(presolver->materialized_bound_source_records);
     free(presolver->substitution_constant);
+    free(presolver->parallel_row_workspace);
     free(presolver->substitution_targets);
     free(presolver->substitution_scales);
     free(presolver->variable_to_box);
     free(presolver->working_box_lower);
     free(presolver->working_box_upper);
+    free(presolver->latest_lower_bound_change);
+    free(presolver->latest_upper_bound_change);
+    free(presolver->fixed_box_dirty);
+    free(presolver->fixed_box_dirty_queue);
     free(presolver->working_constraint_lower);
     free(presolver->working_constraint_upper);
     free(presolver->propagation_lower);
     free(presolver->propagation_upper);
+    free(presolver->nonmaterialized_bound_source_rows);
     free(presolver->converted_affine_cones);
     free(presolver->affine_protected_columns);
     free(presolver->affine_aggregation_source_rows);

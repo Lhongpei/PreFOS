@@ -62,11 +62,15 @@ typedef enum
     PRESOLVE_KERNEL_STOP = 2
 } PresolveKernelUpdate;
 
-typedef PresolveKernelUpdate (*PresolveTightenScalarBound)(void *context, int column,
-                                                           long double candidate,
-                                                           int is_lower);
+typedef PresolveKernelUpdate (*PresolveTightenScalarBound)(
+    void *context, int column, double coefficient,
+    long double candidate, int is_lower);
 typedef void (*PresolveRefreshLinearActivity)(void *context,
                                               PresolveLinearPropagationRow *row);
+typedef int (*PresolveLinearActivityIsExactZero)(void *context,
+                                                 int use_minimum);
+typedef int (*PresolveLinearOutwardActivity)(
+    void *context, int use_minimum, long double *activity);
 
 typedef struct
 {
@@ -81,13 +85,19 @@ typedef struct
     const uint8_t *row_exclusion_flags;
     const int *row_exclusion_sources;
     int row_index;
+    int activity_is_outward;
     double maximum_inferred_bound_magnitude;
     PresolveTightenScalarBound tighten_bound;
     PresolveRefreshLinearActivity refresh_activity;
+    PresolveLinearActivityIsExactZero activity_is_exact_zero;
+    PresolveLinearOutwardActivity outward_activity;
+    size_t *residual_rescans;
+    size_t *residual_rescan_terms;
 } PresolveLinearPropagationOps;
 
 static inline PresolveLinearRowState presolve_internal_classify_linear_row(
     const PresolveLinearActivity *activity, double lower, double upper,
+    /* Feasibility tolerance is scaled; redundancy tolerance is absolute. */
     double feasibility_tolerance, double redundancy_tolerance);
 static inline int presolve_internal_compute_linear_activity(
     const double *values, const int *columns, int length,

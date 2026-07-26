@@ -261,6 +261,14 @@ class PreFOSStats(ct.Structure):
         ("linear_cache_reuses", ct.c_size_t),
         ("linear_cache_bound_changes", ct.c_size_t),
         ("linear_cache_rows_scheduled", ct.c_size_t),
+        ("column_fixing_milliseconds", ct.c_double),
+        ("singleton_column_milliseconds", ct.c_double),
+        ("fixed_box_scan_milliseconds", ct.c_double),
+        ("trivial_candidate_milliseconds", ct.c_double),
+        ("singleton_candidates_examined", ct.c_size_t),
+        ("singleton_row_terms_scanned", ct.c_size_t),
+        ("singleton_row_scan_milliseconds", ct.c_double),
+        ("singleton_substitution_milliseconds", ct.c_double),
     ]
 
 

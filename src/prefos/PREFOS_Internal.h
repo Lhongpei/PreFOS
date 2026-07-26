@@ -20,7 +20,7 @@
 #define PREFOS_MAX_AGGREGATION_TERMS 4
 #endif
 #ifndef PREFOS_MAX_SUBSTITUTION_DEPTH
-#define PREFOS_MAX_SUBSTITUTION_DEPTH 32
+#define PREFOS_MAX_SUBSTITUTION_DEPTH 254
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -72,11 +72,38 @@ struct PreFOSPresolver
     unsigned char *is_substituted;
     unsigned char *is_parallel_removed;
     size_t *substitution_term_count;
-    unsigned char *substitution_incoming_depth;
+    uint16_t *substitution_incoming_depth;
+    unsigned char *substitution_fill_in_targets;
     unsigned char *substitution_keeps_source_row;
     size_t *substitution_term_start;
     int *substitution_source_row;
     int *residual_source_column;
+    unsigned char *rows_require_materialization;
+    int *materialization_row_log;
+    size_t n_materialization_row_log;
+    size_t materialization_row_log_capacity;
+    int materialization_row_log_complete;
+    size_t n_rows_require_materialization;
+    size_t materialization_source_nnz;
+    int working_matrix_is_materialized;
+    int materialized_row_updates_require_cache;
+    size_t *materialized_bound_source_records;
+    size_t n_materialized_bound_source_records;
+    PreFOSCsrMatrix cached_working_matrix;
+    double *cached_working_lower;
+    double *cached_working_upper;
+    int cached_working_matrix_valid;
+    size_t cached_working_fixed_column_epoch;
+    size_t cached_working_column_transformations;
+    int cached_working_parallel_rows_checked;
+    int *parallel_row_workspace;
+    size_t parallel_row_workspace_capacity;
+    int source_parallel_rows_closed;
+    int materialized_parallel_rows_signature_valid;
+    size_t materialized_parallel_rows_fixed_column_epoch;
+    size_t materialized_parallel_rows_column_transformations;
+    size_t materialized_parallel_rows_sorted_count;
+    int materialized_parallel_rows_snapshot_sorted;
     double *substitution_constant;
     int *substitution_targets;
     double *substitution_scales;
@@ -86,10 +113,23 @@ struct PreFOSPresolver
     int *variable_to_box;
     double *working_box_lower;
     double *working_box_upper;
+    size_t *latest_lower_bound_change;
+    size_t *latest_upper_bound_change;
+    unsigned char *fixed_box_dirty;
+    int *fixed_box_dirty_queue;
+    size_t n_fixed_box_dirty;
     double *working_constraint_lower;
     double *working_constraint_upper;
     double *propagation_lower;
     double *propagation_upper;
+    const unsigned char *linear_propagation_seed_rows;
+    size_t linear_propagation_bound_cursor;
+    int linear_propagation_complete;
+    int linear_propagation_hard_work_budget;
+    int linear_propagation_broad_frontier_stop;
+    size_t linear_propagation_broad_frontier_fixed_epoch;
+    size_t linear_propagation_broad_frontier_column_transformations;
+    unsigned char *nonmaterialized_bound_source_rows;
     int scalar_redundancy_completed;
     size_t fixed_column_epoch;
     unsigned char *converted_affine_cones;
@@ -129,6 +169,16 @@ struct PreFOSPresolver
     int has_run;
 };
 
+static inline void prefos_internal_note_constraint_bound_change(
+    PreFOSPresolver *presolver)
+{
+    if (presolver)
+    {
+        presolver->cached_working_matrix_valid = 0;
+        presolver->cached_working_parallel_rows_checked = 0;
+    }
+}
+
 static inline int prefos_internal_term_is_active_in_row(
     const PreFOSPresolver *presolver, size_t row, int column)
 {
@@ -142,6 +192,68 @@ static inline int prefos_internal_term_is_active_in_row(
              presolver->substitution_source_row[column] == (int) row);
 }
 
+static inline void prefos_internal_mark_row_requires_materialization(
+    PreFOSPresolver *presolver, size_t row)
+{
+    if (presolver->rows_require_materialization &&
+        row < presolver->original.A.rows)
+    {
+        if (!presolver->rows_require_materialization[row])
+        {
+            if (presolver->materialization_row_log_complete)
+            {
+                if (presolver->n_materialization_row_log ==
+                    presolver->materialization_row_log_capacity)
+                {
+                    size_t next_capacity =
+                        presolver->materialization_row_log_capacity == 0
+                            ? 1024
+                            : presolver->materialization_row_log_capacity +
+                                  presolver->materialization_row_log_capacity /
+                                      2 +
+                                  1;
+                    int *next_log;
+                    if (next_capacity > presolver->original.A.rows)
+                        next_capacity = presolver->original.A.rows;
+                    next_log = (int *) realloc(
+                        presolver->materialization_row_log,
+                        next_capacity * sizeof(int));
+                    if (!next_log)
+                        presolver->materialization_row_log_complete = 0;
+                    else
+                    {
+                        presolver->materialization_row_log = next_log;
+                        presolver->materialization_row_log_capacity =
+                            next_capacity;
+                    }
+                }
+                if (presolver->materialization_row_log_complete)
+                    presolver->materialization_row_log[
+                        presolver->n_materialization_row_log++] =
+                        (int) row;
+            }
+            size_t row_nnz = (size_t)
+                (presolver->original.A.row_pointers[row + 1] -
+                 presolver->original.A.row_pointers[row]);
+            presolver->rows_require_materialization[row] = 1;
+            ++presolver->n_rows_require_materialization;
+            if (row_nnz <=
+                SIZE_MAX - presolver->materialization_source_nnz)
+                presolver->materialization_source_nnz += row_nnz;
+            else
+                presolver->materialization_source_nnz = SIZE_MAX;
+        }
+    }
+}
+
+static inline int prefos_internal_row_has_exact_linear_form(
+    const PreFOSPresolver *presolver, size_t row)
+{
+    return presolver->working_matrix_is_materialized ||
+           !presolver->rows_require_materialization ||
+           !presolver->rows_require_materialization[row];
+}
+
 PREFOS_INTERNAL void *prefos_internal_alloc_array(size_t count, size_t element_size);
 PREFOS_INTERNAL void prefos_internal_free_csr(PreFOSCsrMatrix *matrix);
 PREFOS_INTERNAL double prefos_internal_safe_midpoint(double lower, double upper);
@@ -152,6 +264,8 @@ PREFOS_INTERNAL int prefos_internal_safe_product(double left, double right,
 PREFOS_INTERNAL double prefos_internal_outward_bound_cast(long double value, int is_lower);
 PREFOS_INTERNAL int prefos_internal_mark_fixed_column(
     PreFOSPresolver *presolver, int column, double value);
+PREFOS_INTERNAL void prefos_internal_mark_fixed_box_dirty(
+    PreFOSPresolver *presolver, int column);
 PREFOS_INTERNAL int prefos_internal_mark_removed_row(
     PreFOSPresolver *presolver, size_t row);
 /* Record the old canonical bounds before mutating propagation_lower/upper. */
@@ -171,6 +285,10 @@ PREFOS_INTERNAL PreFOSStatus prefos_internal_append_bound_record(PreFOSPresolver
                                                         double old_bound,
                                                         double new_bound,
                                                         int is_lower);
+PREFOS_INTERNAL void prefos_internal_clear_box_bound_provenance(
+    PreFOSPresolver *presolver, int column, int is_lower);
+PREFOS_INTERNAL double prefos_internal_box_bound_without_row(
+    const PreFOSPresolver *presolver, int column, int row, int is_lower);
 PREFOS_INTERNAL int prefos_internal_values_close(double left, double right,
                                                double tolerance);
 PREFOS_INTERNAL PreFOSStatus prefos_internal_expand_linear_objective(

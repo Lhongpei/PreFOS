@@ -6,6 +6,7 @@ cmake_minimum_required(VERSION 3.20)
 project(PreFOS VERSION 0.1.0 LANGUAGES C)
 
 include(GNUInstallDirs)
+find_package(Threads REQUIRED)
 
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(PREFOS_BUILD_TESTING "Build the PreFOS test suite" OFF)
@@ -54,6 +55,7 @@ set(PREFOS_SOURCES
   src/prefos/core/PREFOS_Postsolve.c
   src/prefos/core/PREFOS_Problem.c
   src/prefos/core/PREFOS_Timer.c
+  src/prefos/core/PREFOS_WorkingMatrix.c
   src/prefos/explorers/PREFOS_AffineConeAggregation.c
   src/prefos/explorers/PREFOS_AffineConeBounds.c
   src/prefos/explorers/PREFOS_AffineConePropagation.c
@@ -71,6 +73,9 @@ set(PREFOS_SOURCES
   src/prefos/explorers/PREFOS_FreeColumnSubstitution.c
   src/prefos/explorers/PREFOS_LinearPropagation.c
   src/prefos/explorers/PREFOS_LinearPropagationCache.c
+  src/prefos/explorers/PREFOS_MaterializedColumnClosure.c
+  src/prefos/explorers/PREFOS_MaterializedDoubletons.c
+  src/prefos/explorers/PREFOS_TransformedColumnView.c
   src/prefos/explorers/PREFOS_ParallelColumns.c
   src/prefos/explorers/PREFOS_ParallelRows.c
   src/prefos/explorers/PREFOS_RedundantBounds.c
@@ -129,14 +134,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(PREFOS_ENABLE_CUDA)
-  find_package(Threads REQUIRED)
   set_target_properties(PreFOS PROPERTIES
     CUDA_STANDARD 14
     CUDA_STANDARD_REQUIRED ON
   )
   target_compile_definitions(PreFOS PRIVATE PREFOS_HAS_CUDA=1)
-  target_link_libraries(PreFOS PRIVATE Threads::Threads)
 endif()
+
+target_link_libraries(PreFOS PRIVATE Threads::Threads)
 
 if(MSVC)
   target_compile_options(PreFOS PRIVATE /W4)
@@ -176,6 +181,9 @@ if(PREFOS_BUILD_TESTING)
 
   add_executable(prefos_column_reduction_tests tests/test_column_reductions.c)
   target_link_libraries(prefos_column_reduction_tests PRIVATE PreFOS::PreFOS)
+  if(NOT MSVC)
+    target_link_libraries(prefos_column_reduction_tests PRIVATE m)
+  endif()
   add_test(NAME prefos_column_reduction_tests COMMAND prefos_column_reduction_tests)
 
   add_executable(prefos_cpp_tests tests/test_prefos_cpp.cpp)

@@ -8,6 +8,7 @@ import argparse
 import contextlib
 import ctypes as ct
 import gzip
+import hashlib
 import json
 import shutil
 import statistics
@@ -137,7 +138,7 @@ def readable_mps(path, stack):
     return Path(temporary.name)
 
 
-def parse_lp(path):
+def parse_lp_highs(path):
     parse_start = time.perf_counter()
     with contextlib.ExitStack() as stack:
         readable = readable_mps(path, stack)
@@ -166,8 +167,10 @@ def parse_lp(path):
         if sparse.nnz > np.iinfo(np.int32).max:
             raise RuntimeError("matrix has more entries than the C APIs support")
         objective = np.asarray(lp.col_cost_, dtype=np.float64)
+        objective_offset = float(getattr(lp, "offset_", 0.0))
         if lp.sense_ == highspy.ObjSense.kMaximize:
             objective = -objective
+            objective_offset = -objective_offset
         result = {
             "A_values": np.ascontiguousarray(sparse.data, dtype=np.float64),
             "A_indices": np.ascontiguousarray(sparse.indices, dtype=np.int32),
@@ -181,6 +184,7 @@ def parse_lp(path):
                 lp.col_upper_, dtype=np.float64
             ),
             "objective": np.ascontiguousarray(objective, dtype=np.float64),
+            "objective_offset": objective_offset,
             "rows": int(lp.num_row_),
             "columns": int(lp.num_col_),
             "nnz": int(sparse.nnz),
@@ -192,6 +196,168 @@ def parse_lp(path):
             ),
         }
     result["parse_seconds"] = time.perf_counter() - parse_start
+    return result
+
+
+def parse_lp_gurobi(path):
+    import gurobipy as gp
+
+    parse_start = time.perf_counter()
+    environment = gp.Env(empty=True)
+    environment.setParam("OutputFlag", 0)
+    environment.start()
+    model = None
+    relaxed = None
+    try:
+        model = gp.read(str(path), env=environment)
+        variables = model.getVars()
+        integer_columns = sum(
+            variable.VType != gp.GRB.CONTINUOUS for variable in variables
+        )
+        dropped_general_constraints = model.NumGenConstrs
+        dropped_sos_constraints = model.NumSOS
+
+        relaxed = model.relax()
+        relaxed.update()
+        if relaxed.NumQConstrs or relaxed.NumQNZs:
+            raise RuntimeError(
+                "the relaxed model is quadratic; the LP benchmark only "
+                "accepts linear objectives and constraints"
+            )
+        if relaxed.NumGenConstrs or relaxed.NumSOS:
+            raise RuntimeError(
+                "Gurobi relaxation retained unsupported general constraints"
+            )
+
+        sparse = relaxed.getA().tocsr()
+        sparse.sum_duplicates()
+        sparse.eliminate_zeros()
+        sparse.sort_indices()
+        if sparse.nnz > np.iinfo(np.int32).max:
+            raise RuntimeError("matrix has more entries than the C APIs support")
+
+        constraints = relaxed.getConstrs()
+        senses = np.asarray(
+            relaxed.getAttr(gp.GRB.Attr.Sense, constraints), dtype="U1"
+        )
+        rhs = np.asarray(
+            relaxed.getAttr(gp.GRB.Attr.RHS, constraints), dtype=np.float64
+        )
+        row_lower = np.full(relaxed.NumConstrs, -np.inf, dtype=np.float64)
+        row_upper = np.full(relaxed.NumConstrs, np.inf, dtype=np.float64)
+        row_lower[(senses == ">") | (senses == "=")] = rhs[
+            (senses == ">") | (senses == "=")
+        ]
+        row_upper[(senses == "<") | (senses == "=")] = rhs[
+            (senses == "<") | (senses == "=")
+        ]
+
+        relaxed_variables = relaxed.getVars()
+        column_lower = np.asarray(
+            relaxed.getAttr(gp.GRB.Attr.LB, relaxed_variables),
+            dtype=np.float64,
+        )
+        column_upper = np.asarray(
+            relaxed.getAttr(gp.GRB.Attr.UB, relaxed_variables),
+            dtype=np.float64,
+        )
+        column_lower[column_lower <= -gp.GRB.INFINITY] = -np.inf
+        column_upper[column_upper >= gp.GRB.INFINITY] = np.inf
+        objective = np.asarray(
+            relaxed.getAttr(gp.GRB.Attr.Obj, relaxed_variables),
+            dtype=np.float64,
+        )
+        objective_offset = float(relaxed.ObjCon)
+        if relaxed.ModelSense == gp.GRB.MAXIMIZE:
+            objective = -objective
+            objective_offset = -objective_offset
+
+        result = {
+            "A_values": np.ascontiguousarray(
+                sparse.data, dtype=np.float64
+            ),
+            "A_indices": np.ascontiguousarray(
+                sparse.indices, dtype=np.int32
+            ),
+            "A_indptr": np.ascontiguousarray(
+                sparse.indptr, dtype=np.int32
+            ),
+            "row_lower": np.ascontiguousarray(row_lower),
+            "row_upper": np.ascontiguousarray(row_upper),
+            "column_lower": np.ascontiguousarray(column_lower),
+            "column_upper": np.ascontiguousarray(column_upper),
+            "objective": np.ascontiguousarray(objective),
+            "objective_offset": objective_offset,
+            "rows": int(relaxed.NumConstrs),
+            "columns": int(relaxed.NumVars),
+            "nnz": int(sparse.nnz),
+            "integer_columns": int(integer_columns),
+            "dropped_general_constraints": int(
+                dropped_general_constraints
+            ),
+            "dropped_sos_constraints": int(dropped_sos_constraints),
+        }
+    finally:
+        if relaxed is not None:
+            relaxed.dispose()
+        if model is not None:
+            model.dispose()
+        environment.dispose()
+    result["parse_seconds"] = time.perf_counter() - parse_start
+    return result
+
+
+def parse_lp(path, parser="highs"):
+    if parser == "highs":
+        return parse_lp_highs(path)
+    if parser == "gurobi":
+        return parse_lp_gurobi(path)
+    raise ValueError(f"unknown LP parser: {parser}")
+
+
+def parse_lp_cached(path, parser, cache_directory):
+    if cache_directory is None:
+        return parse_lp(path, parser)
+    stat = path.stat()
+    fingerprint = hashlib.sha256(
+        (
+            f"prefos-lp-v1\0{path.resolve()}\0{parser}\0"
+            f"{stat.st_size}\0{stat.st_mtime_ns}"
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    entry = cache_directory / f"{path.name}.{fingerprint}"
+    metadata_path = entry / "metadata.json"
+    array_keys = (
+        "A_values",
+        "A_indices",
+        "A_indptr",
+        "row_lower",
+        "row_upper",
+        "column_lower",
+        "column_upper",
+        "objective",
+    )
+    if metadata_path.is_file():
+        with metadata_path.open(encoding="utf-8") as source:
+            result = json.load(source)
+        for key in array_keys:
+            result[key] = np.load(
+                entry / f"{key}.npy", mmap_mode="c"
+            )
+        return result
+
+    result = parse_lp(path, parser)
+    entry.mkdir(parents=True, exist_ok=True)
+    for key in array_keys:
+        np.save(entry / f"{key}.npy", result[key])
+    metadata = {
+        key: value
+        for key, value in result.items()
+        if key not in array_keys
+    }
+    with metadata_path.open("w", encoding="utf-8") as target:
+        json.dump(metadata, target, sort_keys=True)
+        target.write("\n")
     return result
 
 
@@ -235,7 +401,7 @@ def prefos_problem(data):
         empty_r,
         ct.POINTER(ct.c_double)(),
         ptr(data["objective"], ct.c_double),
-        0.0,
+        float(data.get("objective_offset", 0.0)),
         columns,
         ptr(box_indices, ct.c_int),
         ptr(data["column_lower"], ct.c_double),
@@ -257,26 +423,98 @@ def run_prefos(library, data, args):
         if args.prefos_strict
         else library.prefos_default_settings()
     )
+    if args.prefos_feasibility_tolerance is not None:
+        settings.feasibility_tolerance = (
+            args.prefos_feasibility_tolerance
+        )
+    if args.prefos_fixed_variable_tolerance is not None:
+        settings.fixed_variable_tolerance = (
+            args.prefos_fixed_variable_tolerance
+        )
+    if getattr(args, "prefos_bound_policy", None) == "first-order":
+        settings.propagated_bound_policy = 0
+    elif getattr(args, "prefos_bound_policy", None) == "interior-point":
+        settings.propagated_bound_policy = 1
     if args.prefos_bounded_doubletons:
         settings.bounded_doubleton_substitution = 1
+    if args.prefos_disable_bounded_doubletons:
+        settings.bounded_doubleton_substitution = 0
+    if getattr(
+        args, "prefos_max_bounded_doubleton_column_degree", None
+    ) is not None:
+        settings.max_bounded_doubleton_column_degree = (
+            args.prefos_max_bounded_doubleton_column_degree
+        )
+    if args.prefos_max_aggregation_column_degree is not None:
+        settings.max_aggregation_column_degree = (
+            args.prefos_max_aggregation_column_degree
+        )
+    if args.prefos_max_aggregation_fill is not None:
+        settings.max_aggregation_fill = args.prefos_max_aggregation_fill
+    if args.prefos_max_aggregation_rounds is not None:
+        settings.max_aggregation_rounds = (
+            args.prefos_max_aggregation_rounds
+        )
     if args.prefos_exhaustive_bounds:
         settings.finite_bound_improvement_absolute = 0.0
         settings.finite_bound_improvement_relative = 0.0
         settings.linear_propagation_max_work_ratio = 0.0
         settings.linear_propagation_min_changes_per_million = 0.0
         settings.linear_propagation_max_stale_rounds = 0
+    if getattr(args, "prefos_bound_improvement_absolute", None) is not None:
+        settings.finite_bound_improvement_absolute = (
+            args.prefos_bound_improvement_absolute
+        )
+    if getattr(args, "prefos_bound_improvement_relative", None) is not None:
+        settings.finite_bound_improvement_relative = (
+            args.prefos_bound_improvement_relative
+        )
     if args.prefos_disable_free_columns:
         settings.free_column_substitution = 0
     if args.prefos_disable_linear_propagation:
         settings.linear_propagation = 0
+    if args.prefos_linear_rounds is not None:
+        settings.max_linear_propagation_rounds = args.prefos_linear_rounds
+    if args.prefos_linear_max_work_ratio is not None:
+        settings.linear_propagation_max_work_ratio = (
+            args.prefos_linear_max_work_ratio
+        )
+    if args.prefos_linear_min_changes_per_million is not None:
+        settings.linear_propagation_min_changes_per_million = (
+            args.prefos_linear_min_changes_per_million
+        )
+    if args.prefos_linear_max_stale_rounds is not None:
+        settings.linear_propagation_max_stale_rounds = (
+            args.prefos_linear_max_stale_rounds
+        )
+    if getattr(
+        args, "prefos_event_queue_max_average_column_degree", None
+    ) is not None:
+        settings.event_queue_max_average_column_degree = (
+            args.prefos_event_queue_max_average_column_degree
+        )
+    if getattr(
+        args, "prefos_event_queue_activity_update_ratio", None
+    ) is not None:
+        settings.event_queue_activity_update_ratio = (
+            args.prefos_event_queue_activity_update_ratio
+        )
     if args.prefos_disable_cone_propagation:
         settings.cone_propagation = 0
     if args.prefos_disable_redundant_rows:
         settings.remove_redundant_rows = 0
     if args.prefos_skip_parallel_rows:
         settings.parallel_row_max_average_nnz = 1e-300
+    if args.prefos_parallel_row_max_average_nnz is not None:
+        settings.parallel_row_max_average_nnz = (
+            args.prefos_parallel_row_max_average_nnz
+        )
     if args.prefos_skip_redundant_row_activity:
         settings.redundant_row_max_average_nnz = 1e-300
+    if args.prefos_redundant_row_max_average_nnz is not None:
+        settings.redundant_row_max_average_nnz = (
+            args.prefos_redundant_row_max_average_nnz
+        )
     if args.prefos_disable_singleton_columns:
         settings.singleton_column_reduction = 0
     if args.prefos_disable_parallel_columns:
@@ -320,11 +558,16 @@ def run_prefos(library, data, args):
                 rows=int(reduced.A.rows),
                 columns=int(reduced.n),
                 nnz=int(reduced.A.nnz),
+                fixed_box_variables=int(stats.fixed_box_variables),
+                tightened_box_bounds=int(stats.tightened_box_bounds),
                 propagated_bounds=int(stats.propagated_box_bounds),
                 propagation_rounds=int(stats.linear_propagation_rounds),
                 propagation_event_rounds=int(stats.linear_event_rounds),
                 propagation_full_scan_rounds=int(
                     stats.linear_full_scan_rounds
+                ),
+                propagation_full_scan_fallbacks=int(
+                    stats.linear_full_scan_fallbacks
                 ),
                 propagation_rows=int(stats.linear_rows_processed),
                 propagation_nnz=int(stats.linear_nnz_processed),
@@ -343,6 +586,30 @@ def run_prefos(library, data, args):
                 ),
                 linear_cache_rows_scheduled=int(
                     stats.linear_cache_rows_scheduled
+                ),
+                column_fixing_milliseconds=float(
+                    stats.column_fixing_milliseconds
+                ),
+                singleton_column_milliseconds=float(
+                    stats.singleton_column_milliseconds
+                ),
+                fixed_box_scan_milliseconds=float(
+                    stats.fixed_box_scan_milliseconds
+                ),
+                trivial_candidate_milliseconds=float(
+                    stats.trivial_candidate_milliseconds
+                ),
+                singleton_candidates_examined=int(
+                    stats.singleton_candidates_examined
+                ),
+                singleton_row_terms_scanned=int(
+                    stats.singleton_row_terms_scanned
+                ),
+                singleton_row_scan_milliseconds=float(
+                    stats.singleton_row_scan_milliseconds
+                ),
+                singleton_substitution_milliseconds=float(
+                    stats.singleton_substitution_milliseconds
                 ),
                 propagation_milliseconds=float(
                     stats.linear_propagation_milliseconds
@@ -417,9 +684,31 @@ def run_prefos(library, data, args):
                 removed_singleton_columns=int(
                     stats.removed_singleton_columns
                 ),
+                substituted_bounded_doubletons=int(
+                    stats.substituted_bounded_doubletons
+                ),
                 tightened_singleton_rows=int(stats.tightened_singleton_rows),
                 dual_fixed_columns=int(stats.dual_fixed_columns),
                 merged_parallel_columns=int(stats.merged_parallel_columns),
+            )
+        else:
+            stats = library.prefos_get_stats(presolver).contents
+            result.update(
+                propagated_bounds=int(stats.propagated_box_bounds),
+                propagation_rounds=int(stats.linear_propagation_rounds),
+                propagation_event_rounds=int(stats.linear_event_rounds),
+                propagation_full_scan_rounds=int(
+                    stats.linear_full_scan_rounds
+                ),
+                propagation_budget_stops=int(stats.linear_budget_stops),
+                propagation_stale_stops=int(stats.linear_stale_stops),
+                fixed_box_variables=int(stats.fixed_box_variables),
+                substituted_free_variables=int(
+                    stats.substituted_free_variables
+                ),
+                removed_redundant_rows=int(stats.removed_redundant_rows),
+                removed_singleton_rows=int(stats.removed_singleton_rows),
+                removed_empty_rows=int(stats.removed_empty_rows),
             )
         return result
     finally:
@@ -486,6 +775,20 @@ def run_pslp(
                 nnz_removed_parallel_columns=int(
                     stats.nnz_removed_parallel_columns
                 ),
+                initialization_seconds=float(stats.initialization_seconds),
+                fast_reduction_seconds=float(stats.fast_reduction_seconds),
+                medium_reduction_seconds=float(stats.medium_reduction_seconds),
+                singleton_column_seconds=float(
+                    stats.singleton_column_seconds
+                ),
+                doubleton_row_seconds=float(stats.doubleton_row_seconds),
+                primal_propagation_seconds=float(
+                    stats.primal_propagation_seconds
+                ),
+                parallel_row_seconds=float(stats.parallel_row_seconds),
+                parallel_column_seconds=float(
+                    stats.parallel_column_seconds
+                ),
             )
         return result
     finally:
@@ -530,7 +833,9 @@ def pslp_breakdown(result):
 
 
 def benchmark_file(prefos, pslp, path, repeats, args):
-    data = parse_lp(path)
+    data = parse_lp_cached(
+        path, args.parser, args.parsed_cache_directory
+    )
     samples = {"prefos": [], "pslp": []}
     for repetition in range(repeats):
         order = ("prefos", "pslp") if repetition % 2 == 0 else ("pslp", "prefos")
@@ -558,6 +863,8 @@ def benchmark_file(prefos, pslp, path, repeats, args):
         "columns_original": data["columns"],
         "nnz_original": data["nnz"],
         "integer_columns_relaxed": data["integer_columns"],
+        "prefos_feasibility_tolerance":
+            args.prefos_feasibility_tolerance,
         "prefos": median_run(samples["prefos"]),
         "pslp": median_run(samples["pslp"]),
     }
@@ -578,14 +885,60 @@ def main():
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--prefos-library", required=True, type=Path)
     parser.add_argument("--pslp-library", required=True, type=Path)
+    parser.add_argument(
+        "--parser", choices=("highs", "gurobi"), default="highs"
+    )
+    parser.add_argument("--parsed-cache-directory", type=Path)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--pslp-max-time", type=float, default=600.0)
     parser.add_argument("--prefos-strict", action="store_true")
+    parser.add_argument(
+        "--prefos-feasibility-tolerance",
+        type=float,
+        default=1e-6,
+        help="default matches PSLP's fixed feasibility tolerance",
+    )
+    parser.add_argument("--prefos-fixed-variable-tolerance", type=float)
+    parser.add_argument(
+        "--prefos-bound-policy",
+        choices=("first-order", "interior-point"),
+    )
     parser.add_argument("--prefos-bounded-doubletons", action="store_true")
+    parser.add_argument(
+        "--prefos-disable-bounded-doubletons", action="store_true"
+    )
+    parser.add_argument("--prefos-max-aggregation-column-degree", type=int)
+    parser.add_argument("--prefos-max-aggregation-fill", type=int)
+    parser.add_argument("--prefos-max-aggregation-rounds", type=int)
+    parser.add_argument(
+        "--prefos-max-bounded-doubleton-column-degree", type=int
+    )
     parser.add_argument("--prefos-exhaustive-bounds", action="store_true")
+    parser.add_argument(
+        "--prefos-bound-improvement-absolute", type=float
+    )
+    parser.add_argument(
+        "--prefos-bound-improvement-relative", type=float
+    )
     parser.add_argument("--prefos-disable-free-columns", action="store_true")
     parser.add_argument(
         "--prefos-disable-linear-propagation", action="store_true"
+    )
+    parser.add_argument("--prefos-linear-rounds", type=int)
+    parser.add_argument(
+        "--prefos-linear-max-work-ratio", type=float
+    )
+    parser.add_argument(
+        "--prefos-linear-min-changes-per-million", type=float
+    )
+    parser.add_argument(
+        "--prefos-linear-max-stale-rounds", type=int
+    )
+    parser.add_argument(
+        "--prefos-event-queue-max-average-column-degree", type=float
+    )
+    parser.add_argument(
+        "--prefos-event-queue-activity-update-ratio", type=float
     )
     parser.add_argument(
         "--prefos-disable-cone-propagation", action="store_true"
@@ -594,8 +947,12 @@ def main():
         "--prefos-disable-redundant-rows", action="store_true"
     )
     parser.add_argument("--prefos-skip-parallel-rows", action="store_true")
+    parser.add_argument("--prefos-parallel-row-max-average-nnz", type=float)
     parser.add_argument(
         "--prefos-skip-redundant-row-activity", action="store_true"
+    )
+    parser.add_argument(
+        "--prefos-redundant-row-max-average-nnz", type=float
     )
     parser.add_argument(
         "--prefos-disable-singleton-columns", action="store_true"

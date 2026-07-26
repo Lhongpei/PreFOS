@@ -229,6 +229,10 @@ PreFOSStatus prefos_affine_face_append_transformation(
         free(affine_coefficients);
         return PREFOS_STATUS_OUT_OF_MEMORY;
     }
+    if (term_count > 0)
+        for (position = 0; position < active_degree; ++position)
+            prefos_internal_mark_row_requires_materialization(
+                presolver, (size_t) active_rows[position]);
     free(active_rows);
     free(active_coefficients);
     free(affine_rows);
@@ -243,8 +247,8 @@ PreFOSStatus prefos_affine_face_append_transformation(
     else
     {
         size_t start = presolver->n_substitution_terms;
-        unsigned char next_depth =
-            (unsigned char) (presolver->substitution_incoming_depth[pivot] + 1);
+        uint16_t next_depth =
+            (uint16_t) (presolver->substitution_incoming_depth[pivot] + 1);
         presolver->is_substituted[pivot] = 1;
         presolver->substitution_term_count[pivot] = term_count;
         presolver->substitution_term_start[pivot] = start;

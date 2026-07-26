@@ -7,13 +7,17 @@
  */
 
 #include "ParallelRowDetection.h"
+#include "PreFOSThread.h"
 
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define PARALLEL_HASH_INV_PRECISION 1e6
+#define PARALLEL_CPU_THREADS 4
+#define PARALLEL_CPU_THRESHOLD 100000
 
 static void insertion_sort_rows(int *rows, size_t count,
                                 const int *support_hashes,
@@ -40,9 +44,10 @@ static void insertion_sort_rows(int *rows, size_t count,
     }
 }
 
-void presolve_sort_rows_by_hash(int *rows, size_t count,
-                                const int *support_hashes,
-                                const int *coefficient_hashes, int *auxiliary)
+static void radix_sort_rows_by_hash(int *rows, size_t count,
+                                    const int *support_hashes,
+                                    const int *coefficient_hashes,
+                                    int *auxiliary)
 {
     size_t counts[256];
     int *source = rows, *destination = auxiliary;
@@ -112,6 +117,101 @@ void presolve_sort_rows_by_hash(int *rows, size_t count,
     if (source != rows) memcpy(rows, source, count * sizeof(int));
 }
 
+typedef struct
+{
+    int *rows;
+    size_t count;
+    const int *support_hashes;
+    const int *coefficient_hashes;
+    int *auxiliary;
+} ParallelSortChunk;
+
+static void *sort_parallel_chunk(void *argument)
+{
+    ParallelSortChunk *chunk = (ParallelSortChunk *) argument;
+    radix_sort_rows_by_hash(
+        chunk->rows, chunk->count, chunk->support_hashes,
+        chunk->coefficient_hashes, chunk->auxiliary);
+    return NULL;
+}
+
+static int compare_hash_keys(int left, int right,
+                             const int *support_hashes,
+                             const int *coefficient_hashes)
+{
+    uint32_t left_support = (uint32_t) support_hashes[left];
+    uint32_t right_support = (uint32_t) support_hashes[right];
+    uint32_t left_coefficient, right_coefficient;
+    if (left_support != right_support)
+        return left_support < right_support ? -1 : 1;
+    left_coefficient = (uint32_t) coefficient_hashes[left];
+    right_coefficient = (uint32_t) coefficient_hashes[right];
+    if (left_coefficient == right_coefficient) return 0;
+    return left_coefficient < right_coefficient ? -1 : 1;
+}
+
+void presolve_sort_rows_by_hash(int *rows, size_t count,
+                                const int *support_hashes,
+                                const int *coefficient_hashes, int *auxiliary)
+{
+    ParallelSortChunk chunks[PARALLEL_CPU_THREADS];
+    PreFOSThread threads[PARALLEL_CPU_THREADS - 1];
+    unsigned char started[PARALLEL_CPU_THREADS - 1] = {0};
+    size_t positions[PARALLEL_CPU_THREADS] = {0};
+    size_t base, extra, offset = 0, output;
+    int n_chunks =
+        prefos_cpu_thread_limit(PARALLEL_CPU_THREADS);
+    int chunk;
+
+    if (count < PARALLEL_CPU_THRESHOLD ||
+        n_chunks == 1)
+    {
+        radix_sort_rows_by_hash(
+            rows, count, support_hashes, coefficient_hashes, auxiliary);
+        return;
+    }
+    base = count / (size_t) n_chunks;
+    extra = count % (size_t) n_chunks;
+    for (chunk = 0; chunk < n_chunks; ++chunk)
+    {
+        size_t chunk_count =
+            base + ((size_t) chunk < extra ? 1U : 0U);
+        chunks[chunk] = (ParallelSortChunk){
+            rows + offset, chunk_count, support_hashes,
+            coefficient_hashes, auxiliary + offset};
+        offset += chunk_count;
+    }
+    for (chunk = 1; chunk < n_chunks; ++chunk)
+        if (prefos_thread_create(
+                &threads[chunk - 1], sort_parallel_chunk,
+                &chunks[chunk]) == 0)
+            started[chunk - 1] = 1;
+        else
+            sort_parallel_chunk(&chunks[chunk]);
+    sort_parallel_chunk(&chunks[0]);
+    for (chunk = 1; chunk < n_chunks; ++chunk)
+        if (started[chunk - 1])
+            (void) prefos_thread_join(&threads[chunk - 1]);
+
+    for (output = 0; output < count; ++output)
+    {
+        int best = -1;
+        for (chunk = 0; chunk < n_chunks; ++chunk)
+        {
+            if (positions[chunk] >= chunks[chunk].count) continue;
+            if (best < 0 ||
+                compare_hash_keys(
+                    chunks[chunk].rows[positions[chunk]],
+                    chunks[best].rows[positions[best]],
+                    support_hashes, coefficient_hashes) < 0)
+                best = chunk;
+        }
+        auxiliary[output] =
+            chunks[best].rows[positions[best]++];
+    }
+    memcpy(rows, auxiliary, count * sizeof(int));
+}
+
 static int row_start(const PresolveSparseRowView *matrix, size_t row)
 {
     return matrix->row_starts[row * matrix->row_range_stride];
@@ -139,7 +239,10 @@ static uint32_t hash_scaled_double_array(const double *values, int length)
     int i;
 
     for (i = 1; i < length; ++i)
-        maximum = fmax(maximum, fabs(values[i]));
+    {
+        double magnitude = fabs(values[i]);
+        if (magnitude > maximum) maximum = magnitude;
+    }
     scale = values[0] > 0.0 ? 1.0 / maximum : -1.0 / maximum;
     for (i = 0; i < length; ++i)
     {
@@ -150,39 +253,286 @@ static uint32_t hash_scaled_double_array(const double *values, int length)
     return hash;
 }
 
+typedef struct
+{
+    const PresolveSparseRowView *matrix;
+    PresolveRowIsActive row_is_active;
+    const void *active_context;
+    int *support_hashes;
+    int *coefficient_hashes;
+    size_t begin;
+    size_t end;
+} ParallelHashChunk;
+
+static void *compute_parallel_hash_chunk(void *argument)
+{
+    ParallelHashChunk *chunk = (ParallelHashChunk *) argument;
+    size_t row;
+    for (row = chunk->begin; row < chunk->end; ++row)
+    {
+        int start, length;
+        if (!chunk->row_is_active(chunk->active_context, row))
+        {
+            chunk->support_hashes[row] = INT_MAX;
+            chunk->coefficient_hashes[row] = INT_MAX;
+            continue;
+        }
+        start = row_start(chunk->matrix, row);
+        length = row_end(chunk->matrix, row) - start;
+        if (start < 0 || length <= 0 || !chunk->matrix->values ||
+            !chunk->matrix->columns ||
+            chunk->matrix->values[start] == 0.0)
+        {
+            chunk->support_hashes[row] = INT_MAX;
+            chunk->coefficient_hashes[row] = INT_MAX;
+            continue;
+        }
+        chunk->support_hashes[row] =
+            (int) hash_int_array(
+                chunk->matrix->columns + start, length);
+        chunk->coefficient_hashes[row] =
+            (int) hash_scaled_double_array(
+                chunk->matrix->values + start, length);
+    }
+    return NULL;
+}
+
 int presolve_compute_parallel_row_hashes(
     const PresolveSparseRowView *matrix, PresolveRowIsActive row_is_active,
     const void *active_context, int *support_hashes, int *coefficient_hashes)
 {
-    size_t row;
+    ParallelHashChunk chunks[PARALLEL_CPU_THREADS];
+    PreFOSThread threads[PARALLEL_CPU_THREADS - 1];
+    unsigned char started[PARALLEL_CPU_THREADS - 1] = {0};
+    size_t base, extra, begin = 0;
+    int n_chunks =
+        prefos_cpu_thread_limit(PARALLEL_CPU_THREADS);
+    int chunk;
     if (!matrix || !row_is_active || !support_hashes || !coefficient_hashes ||
         matrix->row_range_stride == 0 ||
         (matrix->n_rows > 0 && (!matrix->row_starts || !matrix->row_ends)))
         return 0;
 
-    for (row = 0; row < matrix->n_rows; ++row)
+    if (matrix->n_rows < PARALLEL_CPU_THRESHOLD ||
+        n_chunks == 1)
     {
-        int start, length;
-        if (!row_is_active(active_context, row))
-        {
-            support_hashes[row] = INT_MAX;
-            coefficient_hashes[row] = INT_MAX;
-            continue;
-        }
-        start = row_start(matrix, row);
-        length = row_end(matrix, row) - start;
-        if (start < 0 || length <= 0 || !matrix->values || !matrix->columns ||
-            matrix->values[start] == 0.0)
-        {
-            support_hashes[row] = INT_MAX;
-            coefficient_hashes[row] = INT_MAX;
-            continue;
-        }
-        support_hashes[row] =
-            (int) hash_int_array(matrix->columns + start, length);
-        coefficient_hashes[row] =
-            (int) hash_scaled_double_array(matrix->values + start, length);
+        ParallelHashChunk sequential = {
+            matrix, row_is_active, active_context, support_hashes,
+            coefficient_hashes, 0, matrix->n_rows};
+        compute_parallel_hash_chunk(&sequential);
+        return 1;
     }
+    base = matrix->n_rows / (size_t) n_chunks;
+    extra = matrix->n_rows % (size_t) n_chunks;
+    for (chunk = 0; chunk < n_chunks; ++chunk)
+    {
+        size_t count =
+            base + ((size_t) chunk < extra ? 1U : 0U);
+        chunks[chunk] = (ParallelHashChunk){
+            matrix, row_is_active, active_context, support_hashes,
+            coefficient_hashes, begin, begin + count};
+        begin += count;
+    }
+    for (chunk = 1; chunk < n_chunks; ++chunk)
+        if (prefos_thread_create(
+                &threads[chunk - 1], compute_parallel_hash_chunk,
+                &chunks[chunk]) == 0)
+            started[chunk - 1] = 1;
+        else
+            compute_parallel_hash_chunk(&chunks[chunk]);
+    compute_parallel_hash_chunk(&chunks[0]);
+    for (chunk = 1; chunk < n_chunks; ++chunk)
+        if (started[chunk - 1])
+            (void) prefos_thread_join(&threads[chunk - 1]);
+    return 1;
+}
+
+typedef struct
+{
+    const PresolveSparseRowView *matrix;
+    const int *rows;
+    int *support_hashes;
+    int *coefficient_hashes;
+    size_t begin;
+    size_t end;
+} ParallelActiveHashChunk;
+
+typedef struct
+{
+    const PresolveSparseRowView *matrix;
+    const int *rows;
+    int *support_hashes;
+    int *coefficient_hashes;
+    size_t begin;
+    size_t end;
+} ParallelCompactHashChunk;
+
+static void *compute_parallel_active_hash_chunk(void *argument)
+{
+    ParallelActiveHashChunk *chunk =
+        (ParallelActiveHashChunk *) argument;
+    size_t position;
+    for (position = chunk->begin; position < chunk->end; ++position)
+    {
+        int row = chunk->rows[position];
+        int start, length;
+        if (row < 0 ||
+            (size_t) row >= chunk->matrix->n_rows)
+            continue;
+        start = row_start(chunk->matrix, (size_t) row);
+        length = row_end(chunk->matrix, (size_t) row) - start;
+        if (start < 0 || length <= 0 || !chunk->matrix->values ||
+            !chunk->matrix->columns ||
+            chunk->matrix->values[start] == 0.0)
+        {
+            chunk->support_hashes[row] = INT_MAX;
+            chunk->coefficient_hashes[row] = INT_MAX;
+            continue;
+        }
+        chunk->support_hashes[row] =
+            (int) hash_int_array(
+                chunk->matrix->columns + start, length);
+        chunk->coefficient_hashes[row] =
+            (int) hash_scaled_double_array(
+                chunk->matrix->values + start, length);
+    }
+    return NULL;
+}
+
+static void *compute_parallel_compact_hash_chunk(void *argument)
+{
+    ParallelCompactHashChunk *chunk =
+        (ParallelCompactHashChunk *) argument;
+    size_t position;
+    for (position = chunk->begin; position < chunk->end; ++position)
+    {
+        int row = chunk->rows[position];
+        int start, length;
+        if (row < 0 ||
+            (size_t) row >= chunk->matrix->n_rows)
+        {
+            chunk->support_hashes[position] = INT_MAX;
+            chunk->coefficient_hashes[position] = INT_MAX;
+            continue;
+        }
+        start = row_start(chunk->matrix, (size_t) row);
+        length = row_end(chunk->matrix, (size_t) row) - start;
+        if (start < 0 || length <= 0 || !chunk->matrix->values ||
+            !chunk->matrix->columns ||
+            chunk->matrix->values[start] == 0.0)
+        {
+            chunk->support_hashes[position] = INT_MAX;
+            chunk->coefficient_hashes[position] = INT_MAX;
+            continue;
+        }
+        chunk->support_hashes[position] =
+            (int) hash_int_array(
+                chunk->matrix->columns + start, length);
+        chunk->coefficient_hashes[position] =
+            (int) hash_scaled_double_array(
+                chunk->matrix->values + start, length);
+    }
+    return NULL;
+}
+
+int presolve_compute_parallel_row_hash_keys(
+    const PresolveSparseRowView *matrix, const int *rows, size_t count,
+    int *support_hashes, int *coefficient_hashes)
+{
+    ParallelCompactHashChunk chunks[PARALLEL_CPU_THREADS];
+    PreFOSThread threads[PARALLEL_CPU_THREADS - 1];
+    unsigned char started[PARALLEL_CPU_THREADS - 1] = {0};
+    size_t base, extra, begin = 0;
+    int n_chunks =
+        prefos_cpu_thread_limit(PARALLEL_CPU_THREADS);
+    int chunk;
+
+    if (!matrix || (count > 0 && !rows) ||
+        (count > 0 && (!support_hashes || !coefficient_hashes)) ||
+        matrix->row_range_stride == 0 ||
+        (matrix->n_rows > 0 &&
+         (!matrix->row_starts || !matrix->row_ends)))
+        return 0;
+    if (count < PARALLEL_CPU_THRESHOLD || n_chunks == 1)
+    {
+        ParallelCompactHashChunk sequential = {
+            matrix, rows, support_hashes, coefficient_hashes, 0, count};
+        compute_parallel_compact_hash_chunk(&sequential);
+        return 1;
+    }
+    base = count / (size_t) n_chunks;
+    extra = count % (size_t) n_chunks;
+    for (chunk = 0; chunk < n_chunks; ++chunk)
+    {
+        size_t chunk_count =
+            base + ((size_t) chunk < extra ? 1U : 0U);
+        chunks[chunk] = (ParallelCompactHashChunk){
+            matrix, rows, support_hashes, coefficient_hashes,
+            begin, begin + chunk_count};
+        begin += chunk_count;
+    }
+    for (chunk = 1; chunk < n_chunks; ++chunk)
+        if (prefos_thread_create(
+                &threads[chunk - 1],
+                compute_parallel_compact_hash_chunk,
+                &chunks[chunk]) == 0)
+            started[chunk - 1] = 1;
+        else
+            compute_parallel_compact_hash_chunk(&chunks[chunk]);
+    compute_parallel_compact_hash_chunk(&chunks[0]);
+    for (chunk = 1; chunk < n_chunks; ++chunk)
+        if (started[chunk - 1])
+            (void) prefos_thread_join(&threads[chunk - 1]);
+    return 1;
+}
+
+static int compute_parallel_row_hashes_in_set(
+    const PresolveSparseRowView *matrix, const int *rows,
+    size_t count, int *support_hashes, int *coefficient_hashes)
+{
+    ParallelActiveHashChunk chunks[PARALLEL_CPU_THREADS];
+    PreFOSThread threads[PARALLEL_CPU_THREADS - 1];
+    unsigned char started[PARALLEL_CPU_THREADS - 1] = {0};
+    size_t base, extra, begin = 0;
+    int n_chunks =
+        prefos_cpu_thread_limit(PARALLEL_CPU_THREADS);
+    int chunk;
+
+    if (!matrix || (count > 0 && !rows) || !support_hashes ||
+        !coefficient_hashes || matrix->row_range_stride == 0 ||
+        (matrix->n_rows > 0 &&
+         (!matrix->row_starts || !matrix->row_ends)))
+        return 0;
+    if (count < PARALLEL_CPU_THRESHOLD || n_chunks == 1)
+    {
+        ParallelActiveHashChunk sequential = {
+            matrix, rows, support_hashes, coefficient_hashes, 0, count};
+        compute_parallel_active_hash_chunk(&sequential);
+        return 1;
+    }
+    base = count / (size_t) n_chunks;
+    extra = count % (size_t) n_chunks;
+    for (chunk = 0; chunk < n_chunks; ++chunk)
+    {
+        size_t chunk_count =
+            base + ((size_t) chunk < extra ? 1U : 0U);
+        chunks[chunk] = (ParallelActiveHashChunk){
+            matrix, rows, support_hashes, coefficient_hashes,
+            begin, begin + chunk_count};
+        begin += chunk_count;
+    }
+    for (chunk = 1; chunk < n_chunks; ++chunk)
+        if (prefos_thread_create(
+                &threads[chunk - 1],
+                compute_parallel_active_hash_chunk,
+                &chunks[chunk]) == 0)
+            started[chunk - 1] = 1;
+        else
+            compute_parallel_active_hash_chunk(&chunks[chunk]);
+    compute_parallel_active_hash_chunk(&chunks[0]);
+    for (chunk = 1; chunk < n_chunks; ++chunk)
+        if (started[chunk - 1])
+            (void) prefos_thread_join(&threads[chunk - 1]);
     return 1;
 }
 
@@ -212,10 +562,10 @@ static int rows_are_parallel(const PresolveSparseRowView *matrix, int first,
 
 int presolve_find_parallel_rows(
     const PresolveSparseRowView *matrix, PresolveRowIsActive row_is_active,
-    const void *active_context, double tolerance, PresolveSortRows sort_rows,
-    int *parallel_rows, int *support_hashes, int *coefficient_hashes,
-    int *sort_auxiliary, int *group_starts, size_t group_starts_capacity,
-    size_t *n_groups)
+    const void *active_context, double tolerance, int support_only,
+    PresolveSortRows sort_rows, int *parallel_rows, int *support_hashes,
+    int *coefficient_hashes, int *sort_auxiliary, int *group_starts,
+    size_t group_starts_capacity, size_t *n_groups)
 {
     size_t row, active_count = 0;
     if (!matrix || !parallel_rows || !sort_auxiliary ||
@@ -230,7 +580,11 @@ int presolve_find_parallel_rows(
     for (row = 0; row < matrix->n_rows; ++row)
         if (support_hashes[row] != INT_MAX ||
             coefficient_hashes[row] != INT_MAX)
+        {
+            if (support_only)
+                coefficient_hashes[row] = 0;
             parallel_rows[active_count++] = (int) row;
+        }
     if (!sort_rows) sort_rows = presolve_sort_rows_by_hash;
     sort_rows(parallel_rows, active_count, support_hashes, coefficient_hashes,
               sort_auxiliary);
@@ -238,6 +592,73 @@ int presolve_find_parallel_rows(
     return presolve_collect_parallel_row_groups(
         matrix, tolerance, parallel_rows, active_count, support_hashes,
         coefficient_hashes, group_starts, group_starts_capacity, n_groups);
+}
+
+static int find_parallel_rows_in_set(
+    const PresolveSparseRowView *matrix, double tolerance, int support_only,
+    PresolveSortRows sort_rows, int *parallel_rows, size_t active_count,
+    int *support_hashes, int *coefficient_hashes, int *sort_auxiliary,
+    int *sorted_active_rows, size_t *sorted_active_count,
+    int *group_starts, size_t group_starts_capacity, size_t *n_groups)
+{
+    size_t position, write = 0;
+    if (!matrix || (active_count > 0 && !parallel_rows) ||
+        !sort_auxiliary || !group_starts || !n_groups ||
+        !isfinite(tolerance) || tolerance < 0.0 ||
+        group_starts_capacity == 0)
+        return 0;
+    if (!compute_parallel_row_hashes_in_set(
+            matrix, parallel_rows, active_count,
+            support_hashes, coefficient_hashes))
+        return 0;
+    for (position = 0; position < active_count; ++position)
+    {
+        int row = parallel_rows[position];
+        if (row < 0 || (size_t) row >= matrix->n_rows)
+            continue;
+        if (support_hashes[row] == INT_MAX &&
+            coefficient_hashes[row] == INT_MAX)
+            continue;
+        if (support_only)
+            coefficient_hashes[row] = 0;
+        parallel_rows[write++] = row;
+    }
+    if (!sort_rows) sort_rows = presolve_sort_rows_by_hash;
+    sort_rows(parallel_rows, write, support_hashes, coefficient_hashes,
+              sort_auxiliary);
+    if (sorted_active_rows && write > 0)
+        memcpy(sorted_active_rows, parallel_rows, write * sizeof(int));
+    if (sorted_active_count) *sorted_active_count = write;
+    return presolve_collect_parallel_row_groups(
+        matrix, tolerance, parallel_rows, write, support_hashes,
+        coefficient_hashes, group_starts, group_starts_capacity, n_groups);
+}
+
+int presolve_find_parallel_rows_in_set(
+    const PresolveSparseRowView *matrix, double tolerance, int support_only,
+    PresolveSortRows sort_rows, int *parallel_rows, size_t active_count,
+    int *support_hashes, int *coefficient_hashes, int *sort_auxiliary,
+    int *group_starts, size_t group_starts_capacity, size_t *n_groups)
+{
+    return find_parallel_rows_in_set(
+        matrix, tolerance, support_only, sort_rows, parallel_rows,
+        active_count, support_hashes, coefficient_hashes, sort_auxiliary,
+        NULL, NULL, group_starts, group_starts_capacity, n_groups);
+}
+
+int presolve_find_parallel_rows_in_set_with_sorted_copy(
+    const PresolveSparseRowView *matrix, double tolerance, int support_only,
+    PresolveSortRows sort_rows, int *parallel_rows, size_t active_count,
+    int *support_hashes, int *coefficient_hashes, int *sort_auxiliary,
+    int *sorted_active_rows, size_t *sorted_active_count,
+    int *group_starts, size_t group_starts_capacity, size_t *n_groups)
+{
+    if (!sorted_active_rows || !sorted_active_count) return 0;
+    return find_parallel_rows_in_set(
+        matrix, tolerance, support_only, sort_rows, parallel_rows,
+        active_count, support_hashes, coefficient_hashes, sort_auxiliary,
+        sorted_active_rows, sorted_active_count, group_starts,
+        group_starts_capacity, n_groups);
 }
 
 int presolve_collect_parallel_row_groups(
